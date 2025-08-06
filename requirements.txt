@@ -1,0 +1,4 @@
+PyPDF2>=3.0      # 解析 PDF，抽取每页文本
+requests>=2.31   # 调用自定义 LLM HTTP API
+PyYAML>=6.0      # 读写 glossary.yaml / config.json 中 YAML 片段
+tqdm>=4.66       # 进度条友好显示
