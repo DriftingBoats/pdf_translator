@@ -1,0 +1,19 @@
+{
+  "api": {
+    "API_URL": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    "API_KEY": "b45755a1-e34b-44d0-a0a6-2e89ff37e587",
+    "LLM_MODEL": "deepseek-v3-250324",
+    "temperature": 0.2
+  },
+  "paths": {
+    "pdf": "",
+    "output_dir": "",
+    "big_md_name": ""
+  },
+  "chapters": {
+    "00": [2, 14]
+  },
+  "glossary": {
+    "Khun": "Khun"
+  }
+}
