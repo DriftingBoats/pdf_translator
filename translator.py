@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-chapter_translation_agent_cn.py
-—— 章节级 PDF 英译本 → 中文译本批量翻译脚本
-  • 按 config.json 中的页码区间切章
-  • 送 LLM 翻译（维持原段落 <cN> 标签；缺失段输出 {{MISSING}}）
+page_batch_translation_agent_cn.py
+—— 按页数分批 PDF 英译本 → 中文译本批量翻译脚本
+  • 按指定页数X自动分批翻译
+  • 处理句子完整性，确保翻译至句子结束
+  • 自动识别标题并保持格式
+  • 自动编号并最终整合为一个文件
   • 增量更新术语表 glossary.tsv
-  • 生成各章 md + 缺失段落清单 missing_list.txt
 """
 import json, re, textwrap, logging, time, datetime, requests, os, sys
 from pathlib import Path
@@ -41,7 +42,7 @@ def load_config(config_file: str = None) -> Dict:
             config = json.load(f)
         
         # 验证必需的配置项
-        required_keys = ["api", "paths", "chapters"]
+        required_keys = ["api", "paths"]
         for key in required_keys:
             if key not in config:
                 raise KeyError(f"配置文件缺少必需项: {key}")
@@ -102,7 +103,8 @@ PDF_PATH     = Path(CONFIG["paths"]["pdf"])
 OUT_DIR      = Path(CONFIG["paths"]["output_dir"])
 BIG_MD_NAME  = CONFIG["paths"]["big_md_name"]
 
-CHAPTER_MAP  = {cid: tuple(v) for cid, v in CONFIG["chapters"].items()}
+# 新增配置项：每批处理的页数
+PAGES_PER_BATCH = CONFIG.get("pages_per_batch", 10)  # 默认每10页翻译一次
 GLOSS_CFG    = CONFIG.get("glossary", {})
 
 # 验证PDF文件存在
@@ -130,12 +132,44 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%H:%M:%S")
 
 # ========= 辅助函数 ========= #
-def wrap_chapter_with_tags(raw_text: str) -> str:
-    """把章节原文按空行分段，加 <c1>…</c1> 标签"""
+# 移除了detect_titles函数，现在由LLM负责识别标题和页眉页码
+
+def ensure_sentence_completion(text: str) -> str:
+    """确保文本以完整句子结束"""
+    text = text.strip()
+    if not text:
+        return text
+    
+    # 检查是否以句号、问号、感叹号结尾
+    if text[-1] in '.!?':
+        return text
+    
+    # 查找最后一个完整句子的结束位置
+    last_sentence_end = -1
+    for i in range(len(text) - 1, -1, -1):
+        if text[i] in '.!?':
+            # 确保不是缩写（如Mr. Dr.等）
+            if i < len(text) - 1 and text[i+1] in ' \n\t':
+                last_sentence_end = i
+                break
+            elif i == len(text) - 1:
+                last_sentence_end = i
+                break
+    
+    if last_sentence_end > 0:
+        return text[:last_sentence_end + 1]
+    
+    return text
+
+def wrap_batch_with_tags(raw_text: str) -> str:
+    """把批次原文按空行分段，加 <c1>…</c1> 标签，让LLM自行识别标题和页眉页码"""
     segments = [seg.strip() for seg in re.split(r"\n\s*\n", raw_text) if seg.strip()]
     tagged = []
+    
     for idx, seg in enumerate(segments, start=1):
+        # 不再预先标记标题，让LLM自行识别和处理
         tagged.append(f"<c{idx}>{seg}</c{idx}>")
+    
     return "\n\n".join(tagged)
 
 def strip_tags(llm_output: str, keep_missing: bool = True):
@@ -148,9 +182,14 @@ def strip_tags(llm_output: str, keep_missing: bool = True):
             miss_list.append(f"c{idx:03d}")
             if keep_missing:
                 clean_paras.append("{{MISSING}}")
+        elif p.strip() == "" or p.strip().startswith("[页眉页脚]") or p.strip().startswith("[目录]"):  # 处理空标签和特殊标记
+            # 跳过空内容和页眉页脚、目录标记，不添加到clean_paras中
+            pass
         else:
             clean_paras.append(p.strip())
 
+    # 过滤掉空字符串，避免多余的空行
+    clean_paras = [para for para in clean_paras if para.strip()]
     pure_text = "\n\n".join(clean_paras)
     new_terms_block = "\n".join(
         line.strip()
@@ -281,49 +320,74 @@ try:
     
     logging.info(f"PDF加载完成，共{len(pages)}页")
     
-    # 验证章节页码范围
+    # 验证页数配置
     max_page = len(pages)
-    for chap_id, (p_start, p_end) in CHAPTER_MAP.items():
-        if p_start < 1 or p_end > max_page or p_start > p_end:
-            raise ValueError(f"章节{chap_id}页码范围无效: {p_start}-{p_end} (PDF共{max_page}页)")
+    if PAGES_PER_BATCH < 1:
+        raise ValueError(f"每批页数必须大于0，当前设置: {PAGES_PER_BATCH}")
+    
+    logging.info(f"将按每{PAGES_PER_BATCH}页进行分批翻译，PDF共{max_page}页")
     
 except Exception as e:
     raise RuntimeError(f"PDF处理失败: {e}")
 
-# ========= 主循环 ========= #
+# ========= 主处理循环 ========= #
 MISSING_DICT = {}
 big_md_parts = []
-total_chapters = len(CHAPTER_MAP)
-processed_chapters = 0
+total_pages = len(pages)
+total_batches = (total_pages + PAGES_PER_BATCH - 1) // PAGES_PER_BATCH  # 向上取整
+processed_batches = 0
 
-# 创建进度日志
-logging.info(f"开始处理{total_chapters}个章节")
+logging.info(f"开始处理{total_batches}个批次，每批{PAGES_PER_BATCH}页")
 
-for chap_id, (p_start, p_end) in CHAPTER_MAP.items():
-    processed_chapters += 1
-    logging.info(f"=== 处理章节 {chap_id} ({processed_chapters}/{total_chapters}) 页 {p_start}-{p_end} ===")
+# 按页数分批处理
+for batch_num in range(1, total_batches + 1):
+    processed_batches += 1
+    
+    # 计算当前批次的页码范围
+    p_start = (batch_num - 1) * PAGES_PER_BATCH + 1
+    p_end = min(batch_num * PAGES_PER_BATCH, total_pages)
+    batch_id = f"batch_{batch_num:03d}"
+    
+    logging.info(f"=== 处理批次 {batch_num} ({processed_batches}/{total_batches}) 页 {p_start}-{p_end} ===")
     
     try:
-        raw_eng = "\n".join(pages[p_start-1:p_end])          # 页码从 1 开始
+        # 获取当前批次的原始文本
+        raw_eng = "\n".join(pages[p_start-1:p_end])  # 页码从 1 开始
         
         if not raw_eng.strip():
-            logging.warning(f"章节{chap_id}内容为空，跳过")
-            MISSING_DICT[chap_id] = ["整章缺失"]
+            logging.warning(f"批次{batch_num}内容为空，跳过")
+            MISSING_DICT[batch_id] = ["整批缺失"]
             continue
         
-        tagged_eng = wrap_chapter_with_tags(raw_eng)
+        # 检查句子完整性，如果不是最后一批且句子未完整，尝试扩展
+        if batch_num < total_batches:
+            # 检查是否需要扩展到下一页以完成句子
+            completed_text = ensure_sentence_completion(raw_eng)
+            if len(completed_text) < len(raw_eng) * 0.8:  # 如果截断太多，尝试扩展
+                if p_end < total_pages:
+                    # 添加下一页的部分内容直到句子完整
+                    next_page_text = pages[p_end] if p_end < len(pages) else ""
+                    extended_text = raw_eng + "\n" + next_page_text
+                    completed_extended = ensure_sentence_completion(extended_text)
+                    if len(completed_extended) > len(completed_text):
+                        raw_eng = completed_extended
+                        logging.info(f"批次{batch_num}扩展到下一页以完成句子")
+            else:
+                raw_eng = completed_text
+        
+        tagged_eng = wrap_batch_with_tags(raw_eng)
         
         # 检查标签数量是否合理
         tag_count = len(re.findall(r'<c\d+>', tagged_eng))
         if tag_count == 0:
-            logging.warning(f"章节{chap_id}未能正确分段")
+            logging.warning(f"批次{batch_num}未能正确分段")
         else:
-            logging.debug(f"章节{chap_id}分为{tag_count}个段落")
+            logging.debug(f"批次{batch_num}分为{tag_count}个段落")
 
         # --- 获取风格信息 ---
         if not style_cache:
-            # 使用当前章节的前几段作为风格分析样本
-            sample_text = raw_eng[:10000]  # 取前10000字符作为样本
+            # 使用当前批次的前几段作为风格分析样本
+            sample_text = raw_eng[:5000]  # 取前5000字符作为样本
             refresh_style(sample_text)
         
         # --- 构造系统提示 ---
@@ -341,54 +405,89 @@ for chap_id, (p_start, p_end) in CHAPTER_MAP.items():
             • 译文行数 ≈ 源行数。  
             • 结尾自行执行检查：若发现有未输出的 <cX> 段，必须补上 <cX>{{{{MISSING}}}}</cX>。
 
-            3. **术语表**（glossary）  
-            • 见下方《术语表》；若词条已列出，则在译文原样保留，不得译。  
-            • 如遇新专有名词：**不要翻译使用原词 + 在 ```glossary``` 中标记**，脚本后续会增量写入术语表。
+            3. **智能识别与处理**（重要！）
+            • **页眉页脚标记**：遇到以下内容输出特殊标记 <cN>[页眉页脚]</cN>：
+              - 页码信息（如"Page 1 of 506"、"第1页/共506页"等）
+              - 作者信息重复（如邮箱地址、作者名重复出现）
+              - 网站链接、版权信息
+              - 明显的页眉页脚重复内容
+            • **章节标题识别**：识别以下内容并转换为Markdown格式：
+              - 章节标题 → ## 标题
+              - 小节标题 → ### 标题  
+              - "Chapter X"、"第X章" → ## 第X章
+              - 居中的短标题 → ### 标题
+            • **特殊内容处理**：
+              - 作者的话、前言、后记等 → ## 作者的话
+              - 目录、索引等 → [目录]
 
-            4. **风格守则**  
+            4. **术语表**（glossary）  
+            • 见下方《术语表》；若词条已列出，则在译文原样保留，不得译。  
+            • 如遇新专有名词（人名、地名、品牌名等）：**在译文中保持原词不翻译，并在 ```glossary``` 中按格式 原词⇢原词 标记**，脚本后续会增量写入术语表。
+            • 注意：专有名词应保持原文，不要翻译成中文。
+
+            5. **风格守则**  
             • 保持原文风格特征：{style_cache}
-            • 标点：用中文标点，英文专名内部保留半角。  
+            • **第三人称改第一人称**：泰语转译中常见用第三人称称呼自己的对话，必须改成第一人称以符合中文阅读习惯（此规则优先级高于术语表保留原词）。
+            • **标点规范**：用中文标点，英文专名内部保留半角。禁止出现多个连续句号（如。。。、.。。。、.。.等），统一使用省略号……。  
             • 数字、计量单位、货币符号照原文。
             • 保持原文的叙事节奏、语调和情感表达方式。
 
             =============== 术语表（供参考） ===============
             {gloss_block}
 
-            ===== 输出格式（严格遵守，不得添加多余标记） =====
-            <c1>第一段译文</c1>
-            <c2>第二段译文</c2>
+            ===== 输出格式示例 =====
+            输入：
+            <c1>Page 1 of 506</c1>
+            <c2>Author Name</c2>
+            <c3>Chapter 1: The Beginning</c3>
+            <c4>It was a dark and stormy night...</c4>
+            
+            输出：
+            <c1>[页眉页脚]</c1>
+            <c2>[页眉页脚]</c2>
+            <c3># 第一章：开始</c3>
+            <c4>那是一个黑暗而暴风雨的夜晚……</c4>
+            
+            ===== 严格遵守输出格式 =====
+            <c1>第一段译文或空</c1>
+            <c2>第二段译文或空</c2>
             ...
             ```glossary
-            新词1⇢译词1
-            新词2⇢译词2
+            专有名词1⇢专有名词1
+            专有名词2⇢专有名词2
             ```
+            
+            **专有名词处理示例**：
+            - 人名 "John Smith" → 译文中保持 "John Smith"，术语表中添加 "John Smith⇢John Smith"
+            - 地名 "Bangkok" → 译文中保持 "Bangkok"，术语表中添加 "Bangkok⇢Bangkok"
+            - 品牌 "iPhone" → 译文中保持 "iPhone"，术语表中添加 "iPhone⇢iPhone"
             """.strip())
 
         # --- 调用 LLM ---
         try:
-            logging.debug(f"开始翻译章节{chap_id}，内容长度: {len(tagged_eng)}")
+            logging.debug(f"开始翻译批次{batch_num}，内容长度: {len(tagged_eng)}")
             llm_out = call_llm(system_prompt, tagged_eng)
             
             if not llm_out or not llm_out.strip():
                 raise ValueError("LLM返回内容为空")
             
         except Exception as e:
-            logging.error(f"章节{chap_id}翻译失败: {e}")
+            logging.error(f"批次{batch_num}翻译失败: {e}")
             # 创建错误占位符
-            MISSING_DICT[chap_id] = ["翻译失败"]
-            error_content = f"## {chap_id}\n\n**翻译失败**: {e}\n\n原文:\n{raw_eng[:500]}...\n"
+            MISSING_DICT[batch_id] = ["翻译失败"]
+            error_content = f"**翻译失败**: {e}\n\n原文:\n{raw_eng[:500]}...\n"
             
-            chap_path = CHAP_DIR / f"{chap_id}.md"
-            chap_path.write_text(error_content, encoding="utf-8")
+            batch_path = CHAP_DIR / f"{batch_id}.md"
+            batch_path.write_text(error_content, encoding="utf-8")
             big_md_parts.append(error_content)
             
-            logging.warning(f"章节{chap_id}已保存错误占位符")
+            logging.warning(f"批次{batch_num}已保存错误占位符")
             continue
 
         # --- 清洗 & 解析 ---
         try:
             cn_body, new_terms_block, miss = strip_tags(llm_out, keep_missing=True)
-            MISSING_DICT[chap_id] = miss
+            MISSING_DICT[batch_id] = miss
             
             # 验证翻译质量
             if not cn_body.strip():
@@ -399,11 +498,11 @@ for chap_id, (p_start, p_end) in CHAPTER_MAP.items():
             translated_segments = len(re.findall(r'<c\d+>', llm_out))
             
             if abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
-                logging.warning(f"章节{chap_id}段落数量差异较大: 原文{original_segments}段 vs 译文{translated_segments}段")
+                logging.warning(f"批次{batch_num}段落数量差异较大: 原文{original_segments}段 vs 译文{translated_segments}段")
             
         except Exception as e:
-            logging.error(f"章节{chap_id}结果解析失败: {e}")
-            MISSING_DICT[chap_id] = ["解析失败"]
+            logging.error(f"批次{batch_num}结果解析失败: {e}")
+            MISSING_DICT[batch_id] = ["解析失败"]
             cn_body = f"**解析失败**: {e}\n\n原始LLM输出:\n{llm_out[:1000]}..."
             new_terms_block = ""
 
@@ -423,26 +522,26 @@ for chap_id, (p_start, p_end) in CHAPTER_MAP.items():
                         new_terms_count += 1
             
             if new_terms_count > 0:
-                logging.info(f"章节{chap_id}新增{new_terms_count}个术语")
+                logging.info(f"批次{batch_num}新增{new_terms_count}个术语")
                 
         except Exception as e:
-            logging.warning(f"章节{chap_id}术语表更新失败: {e}")
+            logging.warning(f"批次{batch_num}术语表更新失败: {e}")
 
-        # --- 写章节文件 ---
+        # --- 写批次文件 ---
         try:
-            chap_path = CHAP_DIR / f"{chap_id}.md"
-            chapter_content = f"## {chap_id}\n\n{cn_body}\n"
-            chap_path.write_text(chapter_content, encoding="utf-8")
-            big_md_parts.append(chapter_content)
+            batch_path = CHAP_DIR / f"{batch_id}.md"
+            batch_content = f"{cn_body}\n"
+            batch_path.write_text(batch_content, encoding="utf-8")
+            big_md_parts.append(batch_content)
             
             # 验证文件写入
-            if not chap_path.exists() or chap_path.stat().st_size == 0:
+            if not batch_path.exists() or batch_path.stat().st_size == 0:
                 raise IOError("文件写入失败或文件为空")
             
-            logging.info(f"章节 {chap_id} 完成 → {chap_path.name} (缺段 {len(miss)})")
+            logging.info(f"批次 {batch_num} 完成 → {batch_path.name} (缺段 {len(miss)})")
             
         except Exception as e:
-            logging.error(f"章节{chap_id}文件写入失败: {e}")
+            logging.error(f"批次{batch_num}文件写入失败: {e}")
             raise
         
         # 保存进度（每处理完一章就保存术语表）
@@ -455,18 +554,17 @@ for chap_id, (p_start, p_end) in CHAPTER_MAP.items():
         time.sleep(1)
         
     except Exception as e:
-        logging.error(f"处理章节{chap_id}时发生严重错误: {e}")
-        # 记录错误但继续处理下一章节
-        MISSING_DICT[chap_id] = [f"处理错误: {str(e)}"]
+        logging.error(f"处理批次{batch_num}时发生严重错误: {e}")
+        # 记录错误但继续处理下一批次
+        MISSING_DICT[batch_id] = [f"处理错误: {str(e)}"]
         continue
 
 # ========= 汇总输出 ========= #
 logging.info("开始生成汇总报告...")
 
 # 统计信息
-total_chapters = len(CHAPTER_MAP)
-processed_chapters = len([cid for cid in MISSING_DICT if not any("处理错误" in str(m) for m in MISSING_DICT[cid])])  # 排除严重错误的章节
-failed_chapters = [cid for cid, miss_list in MISSING_DICT.items() if any("失败" in str(m) or "错误" in str(m) for m in miss_list)]
+processed_batches_success = len([bid for bid in MISSING_DICT if not any("处理错误" in str(m) for m in MISSING_DICT[bid])])  # 排除严重错误的批次
+failed_batches = [bid for bid, miss_list in MISSING_DICT.items() if any("失败" in str(m) or "错误" in str(m) for m in miss_list)]
 missing_segments = sum(len([m for m in miss_list if m != "翻译失败" and "错误" not in str(m)]) for miss_list in MISSING_DICT.values())
 
 # 1. 术语表
@@ -481,35 +579,36 @@ try:
     missing_report = [
         "# 翻译质量报告",
         f"生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"总章节数: {total_chapters}",
-        f"成功处理: {processed_chapters}",
-        f"失败章节: {len(failed_chapters)}",
+        f"总批次数: {total_batches}",
+        f"成功处理: {processed_batches_success}",
+        f"失败批次: {len(failed_batches)}",
         f"缺失段落: {missing_segments}",
+        f"每批页数: {PAGES_PER_BATCH}",
         "",
         "## 详细信息"
     ]
     
-    # 失败章节
-    if failed_chapters:
-        missing_report.extend(["", "### 失败章节"])
-        for cid in sorted(failed_chapters):
-            missing_report.append(f"- {cid}: {', '.join(MISSING_DICT[cid])}")
+    # 失败批次
+    if failed_batches:
+        missing_report.extend(["", "### 失败批次"])
+        for bid in sorted(failed_batches):
+            missing_report.append(f"- {bid}: {', '.join(MISSING_DICT[bid])}")
     
     # 缺失段落
-    chapters_with_missing = {cid: miss_list for cid, miss_list in MISSING_DICT.items() 
+    batches_with_missing = {bid: miss_list for bid, miss_list in MISSING_DICT.items() 
                            if miss_list and not any("失败" in str(m) or "错误" in str(m) for m in miss_list)}
     
-    if chapters_with_missing:
+    if batches_with_missing:
         missing_report.extend(["", "### 缺失段落"])
-        for cid in sorted(chapters_with_missing):
-            if chapters_with_missing[cid]:
-                missing_report.append(f"- {cid}: {', '.join(chapters_with_missing[cid])}")
+        for bid in sorted(batches_with_missing):
+            if batches_with_missing[bid]:
+                missing_report.append(f"- {bid}: {', '.join(batches_with_missing[bid])}")
     
-    # 成功章节
-    successful_chapters = [cid for cid in MISSING_DICT if cid not in failed_chapters and not MISSING_DICT[cid]]
-    if successful_chapters:
-        missing_report.extend(["", "### 完全成功章节"])
-        missing_report.append(f"共{len(successful_chapters)}章: {', '.join(sorted(successful_chapters))}")
+    # 成功批次
+    successful_batches = [bid for bid in MISSING_DICT if bid not in failed_batches and not MISSING_DICT[bid]]
+    if successful_batches:
+        missing_report.extend(["", "### 完全成功批次"])
+        missing_report.append(f"共{len(successful_batches)}批次: {', '.join(sorted(successful_batches))}")
     
     missing_path = OUT_DIR / "translation_report.txt"
     missing_path.write_text("\n".join(missing_report), encoding="utf-8")
@@ -524,7 +623,8 @@ try:
         header = f"""# 翻译文档
 
 > 生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-> 总章节: {total_chapters} | 成功: {processed_chapters} | 失败: {len(failed_chapters)}
+> 总批次: {total_batches} | 成功: {processed_batches_success} | 失败: {len(failed_batches)}
+> 每批页数: {PAGES_PER_BATCH} | 总页数: {total_pages}
 
 ---
 
@@ -538,31 +638,41 @@ try:
         file_size = big_md_path.stat().st_size
         logging.info(f"全集 Markdown 汇总完成 → {big_md_path} ({file_size:,} 字节)")
     else:
-        logging.warning("没有成功翻译的章节，跳过Markdown汇总")
+        logging.warning("没有成功翻译的批次，跳过Markdown汇总")
 except Exception as e:
     logging.error(f"Markdown汇总失败: {e}")
 
 # 4. 最终统计
 logging.info("=== 翻译流程完成 ===")
-logging.info(f"处理结果: {processed_chapters}/{total_chapters} 章节成功")
-if failed_chapters:
-    logging.warning(f"失败章节: {', '.join(failed_chapters)}")
+logging.info(f"处理结果: {processed_batches_success}/{total_batches} 批次成功")
+if failed_batches:
+    logging.warning(f"失败批次: {', '.join(failed_batches)}")
 if missing_segments > 0:
     logging.warning(f"总计缺失段落: {missing_segments}")
 else:
     logging.info("所有段落翻译完成！")
 
-# 5. 生成重试脚本（如果有失败章节）
-if failed_chapters:
+# 5. 生成重试脚本（如果有失败批次）
+if failed_batches:
     try:
         retry_config = CONFIG.copy()
-        retry_config["chapters"] = {cid: CHAPTER_MAP[cid] for cid in failed_chapters}
+        # 为失败的批次生成重试配置
+        retry_batches = []
+        for bid in failed_batches:
+            if bid.startswith("batch_"):
+                batch_num = int(bid.split("_")[1])
+                p_start = (batch_num - 1) * PAGES_PER_BATCH + 1
+                p_end = min(batch_num * PAGES_PER_BATCH, total_pages)
+                retry_batches.append({"batch_num": batch_num, "pages": [p_start, p_end]})
+        
+        retry_config["failed_batches"] = retry_batches
+        retry_config["pages_per_batch"] = PAGES_PER_BATCH
         
         retry_config_path = OUT_DIR / "retry_config.json"
         with open(retry_config_path, 'w', encoding='utf-8') as f:
             json.dump(retry_config, f, ensure_ascii=False, indent=2)
         
         logging.info(f"重试配置已生成 → {retry_config_path}")
-        logging.info("可使用此配置重新运行脚本处理失败章节")
+        logging.info("可使用此配置重新运行脚本处理失败批次")
     except Exception as e:
         logging.warning(f"重试配置生成失败: {e}")

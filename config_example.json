@@ -1,0 +1,18 @@
+{
+  "api": {
+    "API_URL": "https://api.openai.com/v1/chat/completions",
+    "API_KEY": "your-api-key-here",
+    "LLM_MODEL": "gpt-4",
+    "temperature": 0.2
+  },
+  "paths": {
+    "pdf": "your-document.pdf",
+    "output_dir": "output/your-document",
+    "big_md_name": "translated_document.md"
+  },
+  "pages_per_batch": 5,
+  "glossary": {
+    "example_term": "示例术语",
+    "another_term": "另一个术语"
+  }
+}
