@@ -330,8 +330,9 @@ try:
 except Exception as e:
     raise RuntimeError(f"PDF处理失败: {e}")
 
-# ========= 主处理循环 ========= #
+# ========= 汇总输出 ========= #
 MISSING_DICT = {}
+WARNING_DICT = {}  # 收集段落数量差异等警告信息
 big_md_parts = []
 total_pages = len(pages)
 total_batches = (total_pages + PAGES_PER_BATCH - 1) // PAGES_PER_BATCH  # 向上取整
@@ -498,7 +499,9 @@ for batch_num in range(1, total_batches + 1):
             translated_segments = len(re.findall(r'<c\d+>', llm_out))
             
             if abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
-                logging.warning(f"批次{batch_num}段落数量差异较大: 原文{original_segments}段 vs 译文{translated_segments}段")
+                warning_msg = f"原文{original_segments}段 vs 译文{translated_segments}段"
+                logging.warning(f"批次{batch_num}段落数量差异较大: {warning_msg}")
+                WARNING_DICT[batch_id] = warning_msg
             
         except Exception as e:
             logging.error(f"批次{batch_num}结果解析失败: {e}")
@@ -603,6 +606,12 @@ try:
         for bid in sorted(batches_with_missing):
             if batches_with_missing[bid]:
                 missing_report.append(f"- {bid}: {', '.join(batches_with_missing[bid])}")
+    
+    # 段落数量差异警告
+    if WARNING_DICT:
+        missing_report.extend(["", "### 段落数量差异警告"])
+        for bid in sorted(WARNING_DICT):
+            missing_report.append(f"- {bid}: {WARNING_DICT[bid]}")
     
     # 成功批次
     successful_batches = [bid for bid in MISSING_DICT if bid not in failed_batches and not MISSING_DICT[bid]]
