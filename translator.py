@@ -15,6 +15,50 @@ from typing import Dict, List, Tuple, Optional
 
 from pdfminer.high_level import extract_text   # pip install pdfminer.six
 
+# ========= 缓存管理功能 ========= #
+def clean_cache_files(cache_dir: Path, pdf_path: Path = None, force: bool = False):
+    """清理缓存文件
+    
+    Args:
+        cache_dir: 缓存目录
+        pdf_path: PDF文件路径，用于检查缓存是否过期
+        force: 是否强制清理所有缓存
+    """
+    if not cache_dir.exists():
+        return
+    
+    cache_patterns = [
+        "*_text_cache.txt",      # PDF文本缓存
+        "batch_*_raw_text.txt",  # 批次文本缓存
+    ]
+    
+    cleaned_count = 0
+    for pattern in cache_patterns:
+        for cache_file in cache_dir.glob(pattern):
+            should_clean = force
+            
+            if not should_clean and pdf_path and pdf_path.exists():
+                try:
+                    # 检查缓存是否过期
+                    pdf_mtime = pdf_path.stat().st_mtime
+                    cache_mtime = cache_file.stat().st_mtime
+                    should_clean = cache_mtime < pdf_mtime
+                except Exception:
+                    should_clean = True  # 出错时清理
+            
+            if should_clean:
+                try:
+                    cache_file.unlink()
+                    cleaned_count += 1
+                    logging.info(f"已清理缓存文件: {cache_file.name}")
+                except Exception as e:
+                    logging.warning(f"清理缓存文件失败 {cache_file}: {e}")
+    
+    if cleaned_count > 0:
+        logging.info(f"共清理了 {cleaned_count} 个缓存文件")
+    else:
+        logging.info("没有需要清理的缓存文件")
+
 # ========= 读取配置 ========= #
 def load_config(config_file: str = None) -> Dict:
     """安全加载配置文件"""
@@ -110,6 +154,12 @@ GLOSS_CFG    = CONFIG.get("glossary", {})
 # 验证PDF文件存在
 if not PDF_PATH.exists():
     raise FileNotFoundError(f"PDF文件不存在: {PDF_PATH}")
+
+# ========= 缓存管理 ========= #
+# 检查是否需要清理过期缓存
+if CONFIG.get("clean_cache_on_start", True):
+    logging.info("检查并清理过期缓存文件...")
+    clean_cache_files(OUT_DIR, PDF_PATH, force=False)
 
 # 初始化style_cache相关
 STYLE_FILE = OUT_DIR / "style_cache.txt"
@@ -307,10 +357,46 @@ GLOSSARY = load_glossary(gloss_path)
 GLOSSARY.update(GLOSS_CFG)
 logging.info(f"术语表已加载，共{len(GLOSSARY)}个条目")
 
-# ========= 解析整本 PDF ========= #
+# ========= 解析整本 PDF（带缓存优化）========= #
+def get_pdf_text_with_cache(pdf_path: Path, cache_dir: Path) -> str:
+    """获取PDF文本，优先使用缓存"""
+    # 生成缓存文件路径
+    pdf_name = pdf_path.stem
+    cache_file = cache_dir / f"{pdf_name}_text_cache.txt"
+    
+    # 检查缓存是否存在且有效
+    if cache_file.exists():
+        try:
+            pdf_mtime = pdf_path.stat().st_mtime
+            cache_mtime = cache_file.stat().st_mtime
+            
+            # 如果缓存文件比PDF文件新，使用缓存
+            if cache_mtime >= pdf_mtime:
+                logging.info(f"使用PDF文本缓存: {cache_file}")
+                return cache_file.read_text(encoding="utf-8")
+            else:
+                logging.info("PDF文件已更新，重新提取文本")
+        except Exception as e:
+            logging.warning(f"读取缓存失败: {e}，将重新提取PDF文本")
+    
+    # 提取PDF文本
+    logging.info(f"开始提取PDF文本: {pdf_path}")
+    full_text = extract_text(str(pdf_path), page_numbers=None)
+    
+    # 保存到缓存
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(full_text, encoding="utf-8")
+        logging.info(f"PDF文本已缓存到: {cache_file}")
+    except Exception as e:
+        logging.warning(f"保存文本缓存失败: {e}")
+    
+    return full_text
+
 logging.info(f"开始加载PDF文件: {PDF_PATH}")
 try:
-    full_text = extract_text(str(PDF_PATH), page_numbers=None)   # 读全部文本
+    # 使用缓存优化的文本提取
+    full_text = get_pdf_text_with_cache(PDF_PATH, OUT_DIR)
     if not full_text or not full_text.strip():
         raise ValueError("PDF文件内容为空或无法提取文本")
     
@@ -340,6 +426,33 @@ processed_batches = 0
 
 logging.info(f"开始处理{total_batches}个批次，每批{PAGES_PER_BATCH}页")
 
+def get_batch_text_with_cache(pages: List[str], batch_num: int, p_start: int, p_end: int, cache_dir: Path) -> str:
+    """获取批次文本，优先使用缓存"""
+    batch_id = f"batch_{batch_num:03d}"
+    cache_file = cache_dir / f"{batch_id}_raw_text.txt"
+    
+    # 检查批次文本缓存
+    if cache_file.exists():
+        try:
+            cached_text = cache_file.read_text(encoding="utf-8")
+            if cached_text.strip():
+                logging.debug(f"使用批次文本缓存: {cache_file}")
+                return cached_text
+        except Exception as e:
+            logging.warning(f"读取批次缓存失败: {e}")
+    
+    # 从pages数组中提取文本
+    raw_eng = "\n".join(pages[p_start-1:p_end])  # 页码从 1 开始
+    
+    # 保存批次文本缓存
+    try:
+        cache_file.write_text(raw_eng, encoding="utf-8")
+        logging.debug(f"批次文本已缓存: {cache_file}")
+    except Exception as e:
+        logging.warning(f"保存批次缓存失败: {e}")
+    
+    return raw_eng
+
 # 按页数分批处理
 for batch_num in range(1, total_batches + 1):
     processed_batches += 1
@@ -351,9 +464,21 @@ for batch_num in range(1, total_batches + 1):
     
     logging.info(f"=== 处理批次 {batch_num} ({processed_batches}/{total_batches}) 页 {p_start}-{p_end} ===")
     
+    # 检查是否已有翻译结果缓存
+    batch_md_file = CHAP_DIR / f"{batch_id}.md"
+    if batch_md_file.exists():
+        try:
+            cached_content = batch_md_file.read_text(encoding="utf-8")
+            if cached_content.strip():
+                logging.info(f"批次 {batch_num} 已存在翻译结果，跳过处理")
+                big_md_parts.append(cached_content)
+                continue
+        except Exception as e:
+            logging.warning(f"读取批次翻译缓存失败: {e}，重新处理")
+    
     try:
-        # 获取当前批次的原始文本
-        raw_eng = "\n".join(pages[p_start-1:p_end])  # 页码从 1 开始
+        # 获取当前批次的原始文本（使用缓存优化）
+        raw_eng = get_batch_text_with_cache(pages, batch_num, p_start, p_end, OUT_DIR)
         
         if not raw_eng.strip():
             logging.warning(f"批次{batch_num}内容为空，跳过")
