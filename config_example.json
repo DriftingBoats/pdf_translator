@@ -2,17 +2,61 @@
   "api": {
     "API_URL": "https://api.openai.com/v1/chat/completions",
     "API_KEY": "your-api-key-here",
-    "LLM_MODEL": "gpt-4",
+    "LLM_MODEL": "gpt-4o",
     "temperature": 0.2
   },
   "paths": {
-    "pdf": "your-document.pdf",
-    "output_dir": "output/your-document",
+    "pdf": "path/to/your/document.pdf",
+    "output_dir": "output/document_name",
     "big_md_name": "translated_document.md"
   },
-  "pages_per_batch": 5,
+  "pages_per_batch": 10,
+  "clean_cache_on_start": true,
+  "verbose_logging": false,
+  "chapters": [
+    {
+      "title": "Chapter 1: Introduction",
+      "start_page": 1,
+      "end_page": 10
+    },
+    {
+      "title": "Chapter 2: Methodology",
+      "start_page": 11,
+      "end_page": 25
+    }
+  ],
   "glossary": {
-    "example_term": "示例术语",
-    "another_term": "另一个术语"
+    "machine learning": "机器学习",
+    "artificial intelligence": "人工智能",
+    "neural network": "神经网络",
+    "deep learning": "深度学习",
+    "natural language processing": "自然语言处理"
+  },
+  "_comments": {
+    "api_settings": "API配置 - 需要有效的OpenAI兼容API",
+    "paths": "文件路径配置 - pdf_path为输入文件，output_dir为输出目录",
+    "output_structure": {
+      "chap_md": "翻译结果的Markdown文件存储目录",
+      "raw_content": "原始PDF文本和批次缓存文件存储目录",
+      "glossary.tsv": "术语表文件，自动维护专有名词"
+    },
+    "performance": {
+      "pages_per_batch": "每批处理的页数，建议5-15页，影响内存使用和处理速度",
+      "clean_cache_on_start": "启动时清理过期缓存文件，建议保持true以节省空间",
+      "verbose_logging": "详细日志模式 - false:简洁模式，true:详细调试信息"
+    },
+    "chapters": "章节配置 - 可选，用于按章节组织输出文件",
+    "glossary": "术语表 - 预定义的翻译术语，程序运行时会自动扩展",
+    "optimization_features": {
+      "cache_system": "多层缓存系统可显著提升重复运行性能，首次运行后可节省90%以上时间",
+      "batch_processing": "智能批处理支持断点续传，已完成的批次会自动跳过",
+      "auto_cleanup": "自动清理过期缓存，保持系统整洁"
+    },
+    "logging_features": {
+      "colored_output": "彩色日志输出，不同类型信息使用不同颜色和图标",
+      "progress_bars": "进度条显示，实时跟踪批处理进度",
+      "emoji_indicators": "使用表情符号标识操作类型（📊进度、💾缓存、✅成功、⚠️警告、❌错误）",
+      "structured_format": "结构化日志格式，便于阅读和问题排查"
+    }
   }
 }

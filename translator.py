@@ -9,9 +9,12 @@ page_batch_translation_agent_cn.py
   • 自动编号并最终整合为一个文件
   • 增量更新术语表 glossary.tsv
 """
-import json, re, textwrap, logging, time, datetime, requests, os, sys
+import json, re, textwrap, logging, time, datetime, requests, os, sys, warnings
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+
+# 过滤pdfminer的字体警告信息
+warnings.filterwarnings("ignore", category=UserWarning, module="pdfminer")
 
 from pdfminer.high_level import extract_text   # pip install pdfminer.six
 
@@ -33,6 +36,10 @@ def clean_cache_files(cache_dir: Path, pdf_path: Path = None, force: bool = Fals
     ]
     
     cleaned_count = 0
+    total_size_cleaned = 0
+    
+    logging.info(f"🧹 开始清理缓存文件 (强制清理: {'是' if force else '否'})")
+    
     for pattern in cache_patterns:
         for cache_file in cache_dir.glob(pattern):
             should_clean = force
@@ -48,16 +55,18 @@ def clean_cache_files(cache_dir: Path, pdf_path: Path = None, force: bool = Fals
             
             if should_clean:
                 try:
+                    file_size = cache_file.stat().st_size
                     cache_file.unlink()
                     cleaned_count += 1
-                    logging.info(f"已清理缓存文件: {cache_file.name}")
+                    total_size_cleaned += file_size
+                    logging.info(f"🗑️  删除过期缓存: {cache_file.name} ({file_size/1024:.1f}KB)")
                 except Exception as e:
-                    logging.warning(f"清理缓存文件失败 {cache_file}: {e}")
+                    logging.warning(f"⚠️  清理缓存文件失败 {cache_file}: {e}")
     
     if cleaned_count > 0:
-        logging.info(f"共清理了 {cleaned_count} 个缓存文件")
+        logging.info(f"✅ 缓存清理完成: 删除 {cleaned_count} 个文件，释放 {total_size_cleaned/1024:.1f}KB 空间")
     else:
-        logging.info("没有需要清理的缓存文件")
+        logging.info("💾 无需清理缓存文件")
 
 # ========= 读取配置 ========= #
 def load_config(config_file: str = None) -> Dict:
@@ -156,10 +165,6 @@ if not PDF_PATH.exists():
     raise FileNotFoundError(f"PDF文件不存在: {PDF_PATH}")
 
 # ========= 缓存管理 ========= #
-# 检查是否需要清理过期缓存
-if CONFIG.get("clean_cache_on_start", True):
-    logging.info("检查并清理过期缓存文件...")
-    clean_cache_files(OUT_DIR, PDF_PATH, force=False)
 
 # 初始化style_cache相关
 STYLE_FILE = OUT_DIR / "style_cache.txt"
@@ -176,10 +181,81 @@ HEAD_SEP  = "\n" + ("─"*80) + "\n"
 TAG_PAT   = re.compile(r"<c\d+>(.*?)</c\d+>", re.S)
 NEWTERM_PAT = re.compile(r"```glossary(.*?)```", re.S)
 
-# ========= 日志 ========= #
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s",
-                    datefmt="%H:%M:%S")
+# ========= 日志配置 ========= #
+class ColoredFormatter(logging.Formatter):
+    """彩色日志格式化器"""
+    
+    # 颜色代码
+    COLORS = {
+        'DEBUG': '\033[36m',    # 青色
+        'INFO': '\033[32m',     # 绿色
+        'WARNING': '\033[33m',  # 黄色
+        'ERROR': '\033[31m',    # 红色
+        'CRITICAL': '\033[35m', # 紫色
+        'RESET': '\033[0m'      # 重置
+    }
+    
+    def format(self, record):
+        # 添加颜色
+        color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
+        reset = self.COLORS['RESET']
+        
+        # 格式化时间
+        record.asctime = self.formatTime(record, self.datefmt)
+        
+        # 根据日志级别使用不同格式
+        if record.levelname == 'INFO':
+            if '===' in record.getMessage():
+                # 批次处理标题
+                return f"{color}{'='*60}{reset}\n{color}[{record.asctime}] {record.getMessage()}{reset}\n{color}{'='*60}{reset}"
+            elif '进度:' in record.getMessage():
+                # 进度信息
+                return f"{color}[{record.asctime}] 📊 {record.getMessage()}{reset}"
+            elif '缓存' in record.getMessage():
+                # 缓存相关
+                return f"{color}[{record.asctime}] 💾 {record.getMessage()}{reset}"
+            elif '完成' in record.getMessage() or '成功' in record.getMessage():
+                # 成功信息
+                return f"{color}[{record.asctime}] ✅ {record.getMessage()}{reset}"
+            else:
+                return f"{color}[{record.asctime}] ℹ️  {record.getMessage()}{reset}"
+        elif record.levelname == 'WARNING':
+            return f"{color}[{record.asctime}] ⚠️  {record.getMessage()}{reset}"
+        elif record.levelname == 'ERROR':
+            return f"{color}[{record.asctime}] ❌ {record.getMessage()}{reset}"
+        else:
+            return f"{color}[{record.asctime}] [{record.levelname}] {record.getMessage()}{reset}"
+
+def setup_logging(verbose: bool = False):
+    """设置日志系统"""
+    level = logging.DEBUG if verbose else logging.INFO
+    
+    # 清除现有的处理器
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    
+    # 创建控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(ColoredFormatter(datefmt="%H:%M:%S"))
+    
+    # 配置根日志器
+    logging.basicConfig(
+        level=level,
+        handlers=[console_handler],
+        force=True
+    )
+
+def log_progress(current: int, total: int, prefix: str = "进度", suffix: str = ""):
+    """显示进度条"""
+    percent = (current / total) * 100
+    bar_length = 30
+    filled_length = int(bar_length * current // total)
+    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+    
+    logging.info(f"{prefix}: [{bar}] {percent:.1f}% ({current}/{total}) {suffix}")
+
+# 初始化日志系统
+setup_logging(verbose=CONFIG.get('verbose_logging', False))
 
 # ========= 辅助函数 ========= #
 # 移除了detect_titles函数，现在由LLM负责识别标题和页眉页码
@@ -304,7 +380,10 @@ def call_llm(prompt_sys: str, prompt_user: str, max_retries: int = 3, timeout: i
     last_error = None
     for attempt in range(max_retries):
         try:
-            logging.debug(f"LLM调用尝试 {attempt+1}/{max_retries}")
+            logging.info(f"🤖 调用LLM API - 模型: {LLM_MODEL} (尝试 {attempt+1}/{max_retries})")
+            logging.debug(f"系统提示长度: {len(prompt_sys)} 字符")
+            logging.debug(f"用户输入长度: {len(prompt_user)} 字符")
+            
             resp = requests.post(API_URL, headers=headers, json=payload, timeout=timeout)
             resp.raise_for_status()
             
@@ -316,7 +395,13 @@ def call_llm(prompt_sys: str, prompt_user: str, max_retries: int = 3, timeout: i
             if not content or not content.strip():
                 raise ValueError("API返回内容为空")
             
-            logging.debug(f"LLM调用成功，返回内容长度: {len(content)}")
+            logging.info(f"✅ LLM响应成功 - 输出长度: {len(content)} 字符")
+            
+            # 记录token使用情况（如果可用）
+            if "usage" in result and result["usage"]:
+                usage = result["usage"]
+                logging.info(f"📊 Token使用: 输入{usage.get('prompt_tokens', 0)} + 输出{usage.get('completion_tokens', 0)} = 总计{usage.get('total_tokens', 0)}")
+            
             return content.strip()
             
         except requests.exceptions.Timeout:
@@ -347,9 +432,17 @@ try:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     CHAP_DIR = OUT_DIR / "chap_md"
     CHAP_DIR.mkdir(exist_ok=True)
+    RAW_CONTENT_DIR = OUT_DIR / "raw_content"
+    RAW_CONTENT_DIR.mkdir(exist_ok=True)
     logging.info(f"输出目录已准备: {OUT_DIR}")
+    logging.info(f"原始内容目录已准备: {RAW_CONTENT_DIR}")
 except Exception as e:
     raise RuntimeError(f"创建输出目录失败: {e}")
+
+# 检查是否需要清理过期缓存
+if CONFIG.get("clean_cache_on_start", True):
+    logging.info("=== 检查并清理过期缓存文件 ===")
+    clean_cache_files(RAW_CONTENT_DIR, PDF_PATH, force=False)
 
 gloss_path = OUT_DIR / "glossary.tsv"
 GLOSSARY = load_glossary(gloss_path)
@@ -372,22 +465,32 @@ def get_pdf_text_with_cache(pdf_path: Path, cache_dir: Path) -> str:
             
             # 如果缓存文件比PDF文件新，使用缓存
             if cache_mtime >= pdf_mtime:
-                logging.info(f"使用PDF文本缓存: {cache_file}")
-                return cache_file.read_text(encoding="utf-8")
+                cache_size = cache_file.stat().st_size
+                logging.info(f"💾 使用PDF文本缓存: {cache_file.name} ({cache_size/1024:.1f}KB)")
+                cached_text = cache_file.read_text(encoding="utf-8")
+                logging.info(f"📄 缓存文本长度: {len(cached_text)} 字符")
+                return cached_text
             else:
-                logging.info("PDF文件已更新，重新提取文本")
+                logging.info("📝 PDF文件已更新，重新提取文本")
         except Exception as e:
             logging.warning(f"读取缓存失败: {e}，将重新提取PDF文本")
     
     # 提取PDF文本
-    logging.info(f"开始提取PDF文本: {pdf_path}")
+    logging.info(f"🔍 开始提取PDF文本: {pdf_path.name}")
+    import time
+    start_time = time.time()
+    
     full_text = extract_text(str(pdf_path), page_numbers=None)
+    
+    extract_time = time.time() - start_time
     
     # 保存到缓存
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(full_text, encoding="utf-8")
-        logging.info(f"PDF文本已缓存到: {cache_file}")
+        cache_size = cache_file.stat().st_size
+        logging.info(f"💾 PDF文本已缓存: {cache_file.name} ({cache_size/1024:.1f}KB, 耗时{extract_time:.1f}秒)")
+        logging.info(f"📄 提取文本长度: {len(full_text)} 字符")
     except Exception as e:
         logging.warning(f"保存文本缓存失败: {e}")
     
@@ -395,8 +498,8 @@ def get_pdf_text_with_cache(pdf_path: Path, cache_dir: Path) -> str:
 
 logging.info(f"开始加载PDF文件: {PDF_PATH}")
 try:
-    # 使用缓存优化的文本提取
-    full_text = get_pdf_text_with_cache(PDF_PATH, OUT_DIR)
+    # 获取PDF文本（使用缓存）
+    full_text = get_pdf_text_with_cache(PDF_PATH, RAW_CONTENT_DIR)
     if not full_text or not full_text.strip():
         raise ValueError("PDF文件内容为空或无法提取文本")
     
@@ -424,7 +527,8 @@ total_pages = len(pages)
 total_batches = (total_pages + PAGES_PER_BATCH - 1) // PAGES_PER_BATCH  # 向上取整
 processed_batches = 0
 
-logging.info(f"开始处理{total_batches}个批次，每批{PAGES_PER_BATCH}页")
+logging.info(f"=== 开始分批翻译处理 ===")
+logging.info(f"总批次: {total_batches} | 每批页数: {PAGES_PER_BATCH} | 总页数: {total_pages}")
 
 def get_batch_text_with_cache(pages: List[str], batch_num: int, p_start: int, p_end: int, cache_dir: Path) -> str:
     """获取批次文本，优先使用缓存"""
@@ -436,7 +540,9 @@ def get_batch_text_with_cache(pages: List[str], batch_num: int, p_start: int, p_
         try:
             cached_text = cache_file.read_text(encoding="utf-8")
             if cached_text.strip():
-                logging.debug(f"使用批次文本缓存: {cache_file}")
+                cache_size = cache_file.stat().st_size
+                logging.debug(f"💾 使用批次文本缓存: {cache_file.name} ({cache_size/1024:.1f}KB)")
+                logging.debug(f"📄 批次文本长度: {len(cached_text)} 字符")
                 return cached_text
         except Exception as e:
             logging.warning(f"读取批次缓存失败: {e}")
@@ -447,7 +553,9 @@ def get_batch_text_with_cache(pages: List[str], batch_num: int, p_start: int, p_
     # 保存批次文本缓存
     try:
         cache_file.write_text(raw_eng, encoding="utf-8")
-        logging.debug(f"批次文本已缓存: {cache_file}")
+        cache_size = cache_file.stat().st_size
+        logging.debug(f"💾 批次文本已缓存: {cache_file.name} ({cache_size/1024:.1f}KB)")
+        logging.debug(f"📄 批次文本长度: {len(raw_eng)} 字符")
     except Exception as e:
         logging.warning(f"保存批次缓存失败: {e}")
     
@@ -462,7 +570,8 @@ for batch_num in range(1, total_batches + 1):
     p_end = min(batch_num * PAGES_PER_BATCH, total_pages)
     batch_id = f"batch_{batch_num:03d}"
     
-    logging.info(f"=== 处理批次 {batch_num} ({processed_batches}/{total_batches}) 页 {p_start}-{p_end} ===")
+    logging.info(f"=== 处理批次 {batch_num}/{total_batches} (页 {p_start}-{p_end}) ===")
+    log_progress(processed_batches, total_batches, "批次进度", f"当前: 批次{batch_num}")
     
     # 检查是否已有翻译结果缓存
     batch_md_file = CHAP_DIR / f"{batch_id}.md"
@@ -470,19 +579,21 @@ for batch_num in range(1, total_batches + 1):
         try:
             cached_content = batch_md_file.read_text(encoding="utf-8")
             if cached_content.strip():
-                logging.info(f"批次 {batch_num} 已存在翻译结果，跳过处理")
+                logging.info(f"💾 批次 {batch_num} 已存在翻译结果，跳过处理")
                 big_md_parts.append(cached_content)
+                log_progress(processed_batches, total_batches, "批次进度", "使用缓存")
                 continue
         except Exception as e:
             logging.warning(f"读取批次翻译缓存失败: {e}，重新处理")
     
     try:
-        # 获取当前批次的原始文本（使用缓存优化）
-        raw_eng = get_batch_text_with_cache(pages, batch_num, p_start, p_end, OUT_DIR)
+        # 获取批次文本（使用缓存）
+        raw_eng = get_batch_text_with_cache(pages, batch_num, p_start, p_end, RAW_CONTENT_DIR)
         
         if not raw_eng.strip():
-            logging.warning(f"批次{batch_num}内容为空，跳过")
+            logging.warning(f"📄 批次{batch_num}内容为空，跳过")
             MISSING_DICT[batch_id] = ["整批缺失"]
+            log_progress(processed_batches, total_batches, "批次进度", "内容为空")
             continue
         
         # 检查句子完整性，如果不是最后一批且句子未完整，尝试扩展
@@ -497,7 +608,7 @@ for batch_num in range(1, total_batches + 1):
                     completed_extended = ensure_sentence_completion(extended_text)
                     if len(completed_extended) > len(completed_text):
                         raw_eng = completed_extended
-                        logging.info(f"批次{batch_num}扩展到下一页以完成句子")
+                        logging.info(f"📝 批次{batch_num}扩展到下一页以完成句子")
             else:
                 raw_eng = completed_text
         
@@ -506,9 +617,9 @@ for batch_num in range(1, total_batches + 1):
         # 检查标签数量是否合理
         tag_count = len(re.findall(r'<c\d+>', tagged_eng))
         if tag_count == 0:
-            logging.warning(f"批次{batch_num}未能正确分段")
+            logging.warning(f"⚠️  批次{batch_num}未能正确分段")
         else:
-            logging.debug(f"批次{batch_num}分为{tag_count}个段落")
+            logging.info(f"📝 批次{batch_num}分为{tag_count}个段落，文本长度: {len(raw_eng)} 字符")
 
         # --- 获取风格信息 ---
         if not style_cache:
@@ -591,7 +702,7 @@ for batch_num in range(1, total_batches + 1):
 
         # --- 调用 LLM ---
         try:
-            logging.debug(f"开始翻译批次{batch_num}，内容长度: {len(tagged_eng)}")
+            logging.info(f"🤖 开始翻译批次{batch_num}，内容长度: {len(tagged_eng)} 字符")
             llm_out = call_llm(system_prompt, tagged_eng)
             
             if not llm_out or not llm_out.strip():
@@ -650,10 +761,10 @@ for batch_num in range(1, total_batches + 1):
                         new_terms_count += 1
             
             if new_terms_count > 0:
-                logging.info(f"批次{batch_num}新增{new_terms_count}个术语")
+                logging.info(f"📚 批次{batch_num}新增{new_terms_count}个术语")
                 
         except Exception as e:
-            logging.warning(f"批次{batch_num}术语表更新失败: {e}")
+            logging.warning(f"⚠️  批次{batch_num}术语表更新失败: {e}")
 
         # --- 写批次文件 ---
         try:
@@ -666,10 +777,12 @@ for batch_num in range(1, total_batches + 1):
             if not batch_path.exists() or batch_path.stat().st_size == 0:
                 raise IOError("文件写入失败或文件为空")
             
-            logging.info(f"批次 {batch_num} 完成 → {batch_path.name} (缺段 {len(miss)})")
+            logging.info(f"✅ 批次 {batch_num} 翻译完成 → {batch_path.name}")
+            if miss:
+                logging.warning(f"⚠️  批次 {batch_num} 有 {len(miss)} 个缺失段落")
             
         except Exception as e:
-            logging.error(f"批次{batch_num}文件写入失败: {e}")
+            logging.error(f"❌ 批次{batch_num}文件写入失败: {e}")
             raise
         
         # 保存进度（每处理完一章就保存术语表）
@@ -688,7 +801,7 @@ for batch_num in range(1, total_batches + 1):
         continue
 
 # ========= 汇总输出 ========= #
-logging.info("开始生成汇总报告...")
+logging.info("=== 开始生成汇总报告 ===")
 
 # 统计信息
 processed_batches_success = len([bid for bid in MISSING_DICT if not any("处理错误" in str(m) for m in MISSING_DICT[bid])])  # 排除严重错误的批次
@@ -778,13 +891,14 @@ except Exception as e:
 
 # 4. 最终统计
 logging.info("=== 翻译流程完成 ===")
-logging.info(f"处理结果: {processed_batches_success}/{total_batches} 批次成功")
+log_progress(total_batches, total_batches, "最终进度", "完成")
+logging.info(f"✅ 处理结果: {processed_batches_success}/{total_batches} 批次成功")
 if failed_batches:
-    logging.warning(f"失败批次: {', '.join(failed_batches)}")
+    logging.warning(f"❌ 失败批次: {', '.join(failed_batches)}")
 if missing_segments > 0:
-    logging.warning(f"总计缺失段落: {missing_segments}")
+    logging.warning(f"⚠️  总计缺失段落: {missing_segments}")
 else:
-    logging.info("所有段落翻译完成！")
+    logging.info("🎉 所有段落翻译完成！")
 
 # 5. 生成重试脚本（如果有失败批次）
 if failed_batches:
