@@ -867,11 +867,8 @@ except Exception as e:
 try:
     if big_md_parts:
         # 添加文档头部
-        header = f"""# 翻译文档
-
-> 生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-> 总批次: {total_batches} | 成功: {processed_batches_success} | 失败: {len(failed_batches)}
-> 每批页数: {PAGES_PER_BATCH} | 总页数: {total_pages}
+        header = f"""全文机翻  
+更多泰百小说见 `https://thaigl.drifting.boats/`
 
 ---
 

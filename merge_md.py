@@ -13,6 +13,9 @@ BIG_MD  = OUT_DIR / CFG["paths"]["big_md_name"]
 
 chap_files = sorted(glob.glob(str(OUT_DIR / "*.md")))
 with open(BIG_MD, "w", encoding="utf-8") as wf:
+    # 添加自定义头部
+    wf.write("全文机翻  \n更多泰百小说见 `https://thaigl.drifting.boats/`\n\n---\n\n")
+    
     for fp in chap_files:
         wf.write(Path(fp).read_text(encoding="utf-8").strip() + "\n\n")
 

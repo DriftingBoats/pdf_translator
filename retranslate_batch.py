@@ -191,6 +191,9 @@ def merge_markdown(config: dict, output_dir: Path) -> bool:
         logging.info(f"📝 开始合并 {len(chap_files)} 个markdown文件...")
         
         with open(big_md_path, "w", encoding="utf-8") as wf:
+            # 添加自定义头部
+            wf.write("全文机翻  \n更多泰百小说见 `https://thaigl.drifting.boats/`\n\n---\n\n")
+            
             for fp in chap_files:
                 content = Path(fp).read_text(encoding="utf-8").strip()
                 if content:
