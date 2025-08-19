@@ -9,7 +9,7 @@ page_batch_translation_agent_cn.py
   • 自动编号并最终整合为一个文件
   • 增量更新术语表 glossary.tsv
 """
-import json, re, textwrap, logging, time, datetime, requests, os, sys, warnings
+import json, re, textwrap, logging, time, datetime, requests, os, sys, warnings, random
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -623,8 +623,30 @@ for batch_num in range(1, total_batches + 1):
 
         # --- 获取风格信息 ---
         if not style_cache:
-            # 使用当前批次的前几段作为风格分析样本
-            sample_text = raw_eng[:5000]  # 取前5000字符作为样本
+            # 从中间随机取样作为风格分析样本，避免取到前言、作者的话等内容
+            text_length = len(raw_eng)
+            sample_length = min(5000, text_length)  # 样本长度不超过文本总长度
+            
+            if text_length > sample_length:
+                # 从文本的中间部分随机选择起始位置
+                # 避免前20%和后20%的内容，主要从中间60%的部分取样
+                start_range_begin = int(text_length * 0.2)
+                start_range_end = int(text_length * 0.8) - sample_length
+                
+                if start_range_end > start_range_begin:
+                    start_pos = random.randint(start_range_begin, start_range_end)
+                    sample_text = raw_eng[start_pos:start_pos + sample_length]
+                    logging.info(f"📝 从文本中间随机取样进行风格分析 (位置: {start_pos}-{start_pos + sample_length})")
+                else:
+                    # 如果文本太短，就取中间部分
+                    start_pos = max(0, (text_length - sample_length) // 2)
+                    sample_text = raw_eng[start_pos:start_pos + sample_length]
+                    logging.info(f"📝 从文本中间取样进行风格分析 (位置: {start_pos}-{start_pos + sample_length})")
+            else:
+                # 文本长度不足5000字符，直接使用全部文本
+                sample_text = raw_eng
+                logging.info("📝 文本较短，使用全部内容进行风格分析")
+            
             refresh_style(sample_text)
         
         # --- 构造系统提示 ---

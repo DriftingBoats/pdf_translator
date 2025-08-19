@@ -20,6 +20,10 @@ import glob
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
+# 正则表达式模式
+TAG_PAT = re.compile(r"<c\d+>(.*?)</c\d+>", re.S)
+NEWTERM_PAT = re.compile(r"```glossary(.*?)```", re.S)
+
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -98,6 +102,32 @@ def wrap_batch_with_tags(raw_text: str) -> str:
     
     return "\n\n".join(tagged)
 
+def strip_tags(llm_output: str, keep_missing: bool = True):
+    """清洗 LLM 输出 & 收集缺失段"""
+    paragraphs = TAG_PAT.findall(llm_output)
+
+    miss_list, clean_paras = [], []
+    for idx, p in enumerate(paragraphs, start=1):
+        if p.strip() == "{{MISSING}}":
+            miss_list.append(f"c{idx:03d}")
+            if keep_missing:
+                clean_paras.append("{{MISSING}}")
+        elif p.strip() == "" or p.strip().startswith("[页眉页脚]") or p.strip().startswith("[目录]"):  # 处理空标签和特殊标记
+            # 跳过空内容和页眉页脚、目录标记，不添加到clean_paras中
+            pass
+        else:
+            clean_paras.append(p.strip())
+
+    # 过滤掉空字符串，避免多余的空行
+    clean_paras = [para for para in clean_paras if para.strip()]
+    pure_text = "\n\n".join(clean_paras)
+    new_terms_block = "\n".join(
+        line.strip()
+        for blk in NEWTERM_PAT.findall(llm_output)
+        for line in blk.strip().splitlines() if line.strip()
+    )
+    return pure_text, new_terms_block, miss_list
+
 def count_segments(text: str) -> int:
     """统计文本中的段落数量"""
     # 如果文本包含标签，按标签计算
@@ -135,7 +165,7 @@ def analyze_batch_differences(output_dir: Path) -> List[Tuple[int, str, int, int
             continue
         
         # 读取原始文本
-        raw_file = raw_content_dir / f"batch_{batch_num:03d}.txt"
+        raw_file = raw_content_dir / f"batch_{batch_num:03d}_raw_text.txt"
         if not raw_file.exists():
             logging.warning(f"批次 {batch_num} 原始文件不存在: {raw_file}")
             continue
@@ -175,7 +205,7 @@ def retranslate_batch(batch_num: int, config: dict, output_dir: Path, glossary: 
     chap_dir = output_dir / "chap_md"
     
     # 读取原始文本
-    raw_file = raw_content_dir / f"batch_{batch_num:03d}.txt"
+    raw_file = raw_content_dir / f"batch_{batch_num:03d}_raw_text.txt"
     if not raw_file.exists():
         logging.error(f"批次 {batch_num} 原始文件不存在: {raw_file}")
         return False
@@ -278,6 +308,36 @@ def retranslate_batch(batch_num: int, config: dict, output_dir: Path, glossary: 
             f"原文{original_segments}段 → 译文{translated_segments}段"
         )
         
+        # 清洗输出并去除标签
+        cn_body, new_terms_block, miss_list = strip_tags(translated_content, keep_missing=True)
+        
+        # 验证翻译质量
+        if not cn_body.strip():
+            raise ValueError("翻译结果为空")
+        
+        # 更新术语表
+        if new_terms_block:
+            new_terms_count = 0
+            for line in new_terms_block.splitlines():
+                if "\t" in line or "⇢" in line:
+                    # 支持两种格式：制表符分隔或箭头分隔
+                    if "⇢" in line:
+                        src, tgt = [x.strip() for x in line.split("⇢", 1)]
+                    else:
+                        src, tgt = [x.strip() for x in line.split("\t", 1)]
+                    
+                    if src and tgt and src not in glossary:
+                        glossary[src] = tgt
+                        new_terms_count += 1
+            
+            if new_terms_count > 0:
+                logging.info(f"📚 批次{batch_num}新增{new_terms_count}个术语")
+                # 保存更新的术语表
+                glossary_path = output_dir / "glossary.tsv"
+                with open(glossary_path, 'w', encoding='utf-8') as f:
+                    for k, v in glossary.items():
+                        f.write(f"{k}\t{v}\n")
+        
         # 保存翻译结果
         output_file = chap_dir / f"batch_{batch_num:03d}.md"
         backup_file = chap_dir / f"batch_{batch_num:03d}.md.backup"
@@ -287,9 +347,12 @@ def retranslate_batch(batch_num: int, config: dict, output_dir: Path, glossary: 
             output_file.rename(backup_file)
             logging.info(f"💾 原翻译文件已备份为: {backup_file.name}")
         
-        # 保存新翻译
-        output_file.write_text(translated_content, encoding='utf-8')
+        # 保存清洗后的内容（去除标签）
+        output_file.write_text(cn_body, encoding='utf-8')
         logging.info(f"✅ 批次 {batch_num} 重新翻译已保存")
+        
+        if miss_list:
+            logging.warning(f"⚠️  批次{batch_num}有{len(miss_list)}个缺失段落: {', '.join(miss_list)}")
         
         return True
         
@@ -354,14 +417,20 @@ def main():
     
     parser = argparse.ArgumentParser(description='重新翻译段落差异较大的批次')
     parser.add_argument('--auto', action='store_true', help='自动模式，跳过交互式确认')
+    parser.add_argument('book_dir', nargs='?', help='书籍目录路径 (例如: output/book1)')
     args = parser.parse_args()
     
     print("🔄 重新翻译段落差异较大的批次")
     print("=" * 50)
     
-    # 交互式获取输出目录
+    # 获取输出目录
     output_dir = None
-    if not args.auto:
+    if args.book_dir:
+        output_dir = Path(args.book_dir)
+        if not output_dir.exists() or not output_dir.is_dir():
+            print(f"❌ 目录不存在: {args.book_dir}")
+            return
+    elif not args.auto:
         while True:
             output_input = input("请输入书籍目录路径 (例如: output/book1): ").strip()
             if output_input:
@@ -404,11 +473,14 @@ def main():
         diff_ratio = abs(original - translated) / original if original > 0 else 0
         print(f"  批次 {batch_num:3d}: {original:3d}段 → {translated:3d}段 (差异: {diff_ratio:.1%})")
     
-    # 询问用户是否继续
-    response = input(f"\n是否重新翻译这 {len(problem_batches)} 个批次? (y/N): ")
-    if response.lower() not in ['y', 'yes', '是']:
-        logging.info("用户取消操作")
-        return
+    # 询问用户是否继续（自动模式跳过确认）
+    if not args.auto:
+        response = input(f"\n是否重新翻译这 {len(problem_batches)} 个批次? (y/N): ")
+        if response.lower() not in ['y', 'yes', '是']:
+            logging.info("用户取消操作")
+            return
+    else:
+        print(f"\n🤖 自动模式：将重新翻译这 {len(problem_batches)} 个批次")
     
     # 重新翻译问题批次
     success_count = 0
