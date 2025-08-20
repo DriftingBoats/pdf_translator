@@ -927,7 +927,7 @@ try:
         header = f"""全文机翻  
 更多泰百小说见 thaigl.drifting.boats
 
----
+——————————
 
 """
         
