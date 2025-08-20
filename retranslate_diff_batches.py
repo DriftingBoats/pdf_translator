@@ -24,6 +24,11 @@ from typing import Dict, List, Tuple, Optional
 TAG_PAT = re.compile(r"<c\d+>(.*?)</c\d+>", re.S)
 NEWTERM_PAT = re.compile(r"```glossary(.*?)```", re.S)
 
+# 成本跟踪全局变量
+total_cost = 0.0
+total_input_tokens = 0
+total_output_tokens = 0
+
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +53,8 @@ def load_config(config_path: str = "config.json") -> dict:
 
 def call_llm(prompt_sys: str, prompt_user: str, config: dict, max_retries: int = 3) -> str:
     """调用LLM API"""
+    global total_cost, total_input_tokens, total_output_tokens
+    
     headers = {
         "Authorization": f"Bearer {config['api']['API_KEY']}",
         "Content-Type": "application/json"
@@ -76,7 +83,40 @@ def call_llm(prompt_sys: str, prompt_user: str, config: dict, max_retries: int =
             if response.status_code == 200:
                 result = response.json()
                 content = result['choices'][0]['message']['content']
-                logging.info(f"✅ API调用成功，返回内容长度: {len(content)} 字符")
+                
+                # 记录token使用情况和计算成本
+                if "usage" in result and result["usage"]:
+                    usage = result["usage"]
+                    input_tokens = usage.get('prompt_tokens', 0)
+                    output_tokens = usage.get('completion_tokens', 0)
+                    total_tokens = usage.get('total_tokens', 0)
+                    
+                    # 累计token统计
+                    total_input_tokens += input_tokens
+                    total_output_tokens += output_tokens
+                    
+                    # 计算成本（如果启用了成本跟踪）
+                    if config.get('pricing', {}).get('enable_cost_tracking', False):
+                        pricing = config.get('pricing', {})
+                        input_price_per_1k = pricing.get('input_price_per_1k_tokens', 0)
+                        output_price_per_1k = pricing.get('output_price_per_1k_tokens', 0)
+                        currency = pricing.get('currency', 'USD')
+                        
+                        batch_input_cost = (input_tokens / 1000) * input_price_per_1k
+                        batch_output_cost = (output_tokens / 1000) * output_price_per_1k
+                        batch_total_cost = batch_input_cost + batch_output_cost
+                        
+                        total_cost += batch_total_cost
+                        
+                        logging.info(f"✅ API调用成功，返回内容长度: {len(content)} 字符")
+                        logging.info(f"📊 Token使用: 输入{input_tokens} + 输出{output_tokens} = 总计{total_tokens}")
+                        logging.info(f"💰 本次成本: {batch_total_cost:.4f} {currency} (输入: {batch_input_cost:.4f} + 输出: {batch_output_cost:.4f})")
+                    else:
+                        logging.info(f"✅ API调用成功，返回内容长度: {len(content)} 字符")
+                        logging.info(f"📊 Token使用: 输入{input_tokens} + 输出{output_tokens} = 总计{total_tokens}")
+                else:
+                    logging.info(f"✅ API调用成功，返回内容长度: {len(content)} 字符")
+                
                 return content
             else:
                 logging.error(f"API调用失败: {response.status_code} - {response.text}")
@@ -303,10 +343,8 @@ def retranslate_batch(batch_num: int, config: dict, output_dir: Path, glossary: 
         # 验证翻译结果
         translated_segments = count_segments(translated_content)
         
-        logging.info(
-            f"📝 批次 {batch_num} 重新翻译完成: "
-            f"原文{original_segments}段 → 译文{translated_segments}段"
-        )
+        # 打印输出段落数和输入段落数对比
+        logging.info(f"📊 批次{batch_num}段落数量对比: 输入{original_segments}段 → 输出{translated_segments}段")
         
         # 清洗输出并去除标签
         cn_body, new_terms_block, miss_list = strip_tags(translated_content, keep_missing=True)
@@ -504,6 +542,19 @@ def main():
     
     if failed_batches:
         print(f"❌ 失败批次: {failed_batches}")
+    
+    # 成本统计总结
+    if config.get('pricing', {}).get('enable_cost_tracking', False):
+        pricing = config.get('pricing', {})
+        currency = pricing.get('currency', 'USD')
+        print(f"\n=== 成本统计总结 ===")
+        print(f"📊 总Token使用: 输入{total_input_tokens:,} + 输出{total_output_tokens:,} = 总计{total_input_tokens + total_output_tokens:,}")
+        print(f"💰 总成本: {total_cost:.4f} {currency}")
+        if total_input_tokens > 0:
+            avg_cost_per_1k_input = (total_cost * 1000) / (total_input_tokens + total_output_tokens) if (total_input_tokens + total_output_tokens) > 0 else 0
+            print(f"📈 平均成本: {avg_cost_per_1k_input:.4f} {currency}/1K tokens")
+    else:
+        print(f"\n📊 Token统计: 输入{total_input_tokens:,} + 输出{total_output_tokens:,} = 总计{total_input_tokens + total_output_tokens:,}")
     
     logging.info(f"重新翻译任务完成: 成功 {success_count}, 失败 {len(failed_batches)}")
     

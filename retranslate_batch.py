@@ -25,6 +25,11 @@ from typing import Dict, List
 TAG_PAT = re.compile(r'<c\d+>(.*?)</c\d+>', re.DOTALL)
 NEWTERM_PAT = re.compile(r'```glossary\s*\n(.*?)\n```', re.DOTALL | re.IGNORECASE)
 
+# 成本跟踪全局变量
+total_cost = 0.0
+total_input_tokens = 0
+total_output_tokens = 0
+
 # 设置简洁的日志格式
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +51,8 @@ def load_config(config_path: str = "config.json") -> dict:
 
 def call_llm(prompt_sys: str, prompt_user: str, config: dict) -> str:
     """调用LLM API"""
+    global total_cost, total_input_tokens, total_output_tokens
+    
     headers = {
         "Authorization": f"Bearer {config['api']['API_KEY']}",
         "Content-Type": "application/json"
@@ -71,7 +78,38 @@ def call_llm(prompt_sys: str, prompt_user: str, config: dict) -> str:
         
         if response.status_code == 200:
             result = response.json()
-            return result['choices'][0]['message']['content']
+            content = result['choices'][0]['message']['content']
+            
+            # 记录token使用情况和计算成本
+            if "usage" in result and result["usage"]:
+                usage = result["usage"]
+                input_tokens = usage.get('prompt_tokens', 0)
+                output_tokens = usage.get('completion_tokens', 0)
+                total_tokens = usage.get('total_tokens', 0)
+                
+                # 累计token统计
+                total_input_tokens += input_tokens
+                total_output_tokens += output_tokens
+                
+                # 计算成本（如果启用了成本跟踪）
+                if config.get('pricing', {}).get('enable_cost_tracking', False):
+                    pricing = config.get('pricing', {})
+                    input_price_per_1k = pricing.get('input_price_per_1k_tokens', 0)
+                    output_price_per_1k = pricing.get('output_price_per_1k_tokens', 0)
+                    currency = pricing.get('currency', 'USD')
+                    
+                    batch_input_cost = (input_tokens / 1000) * input_price_per_1k
+                    batch_output_cost = (output_tokens / 1000) * output_price_per_1k
+                    batch_total_cost = batch_input_cost + batch_output_cost
+                    
+                    total_cost += batch_total_cost
+                    
+                    logging.info(f"📊 Token使用: 输入{input_tokens} + 输出{output_tokens} = 总计{total_tokens}")
+                    logging.info(f"💰 本次成本: {batch_total_cost:.4f} {currency} (输入: {batch_input_cost:.4f} + 输出: {batch_output_cost:.4f})")
+                else:
+                    logging.info(f"📊 Token使用: 输入{input_tokens} + 输出{output_tokens} = 总计{total_tokens}")
+            
+            return content
         else:
             raise Exception(f"API调用失败: {response.status_code} - {response.text}")
             
@@ -272,7 +310,7 @@ def retranslate_batch(batch_num: int, config: dict, output_dir: str, glossary: D
         
         # 检查段落数量是否合理
         translated_segments = len(re.findall(r'<c\d+>', llm_output))
-        logging.info(f"📝 翻译完成: {original_segments} 段 → {translated_segments} 段")
+        logging.info(f"📊 批次{batch_num}段落数量对比: 输入{original_segments}段 → 输出{translated_segments}段")
         
         if abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
             warning_msg = f"原文{original_segments}段 vs 译文{translated_segments}段"
@@ -422,6 +460,19 @@ def main():
     
     # 结果统计
     print(f"\n🎉 处理完成: {success_count}/{len(batches)} 个批次成功")
+    
+    # 成本统计总结
+    if config.get('pricing', {}).get('enable_cost_tracking', False):
+        pricing = config.get('pricing', {})
+        currency = pricing.get('currency', 'USD')
+        print(f"\n=== 成本统计总结 ===")
+        print(f"📊 总Token使用: 输入{total_input_tokens:,} + 输出{total_output_tokens:,} = 总计{total_input_tokens + total_output_tokens:,}")
+        print(f"💰 总成本: {total_cost:.4f} {currency}")
+        if total_input_tokens > 0:
+            avg_cost_per_1k_input = (total_cost * 1000) / (total_input_tokens + total_output_tokens) if (total_input_tokens + total_output_tokens) > 0 else 0
+            print(f"📈 平均成本: {avg_cost_per_1k_input:.4f} {currency}/1K tokens")
+    else:
+        print(f"\n📊 Token统计: 输入{total_input_tokens:,} + 输出{total_output_tokens:,} = 总计{total_input_tokens + total_output_tokens:,}")
     
     # 如果有成功的重新翻译，自动合并markdown文件
     if success_count > 0:

@@ -18,6 +18,11 @@ warnings.filterwarnings("ignore", category=UserWarning, module="pdfminer")
 
 from pdfminer.high_level import extract_text   # pip install pdfminer.six
 
+# 成本跟踪全局变量
+total_cost = 0.0
+total_input_tokens = 0
+total_output_tokens = 0
+
 # ========= 缓存管理功能 ========= #
 def clean_cache_files(cache_dir: Path, pdf_path: Path = None, force: bool = False):
     """清理缓存文件
@@ -364,6 +369,8 @@ def save_glossary(gls: Dict[str,str], path: Path):
 
 def call_llm(prompt_sys: str, prompt_user: str, max_retries: int = 3, timeout: int = 120) -> str:
     """调用LLM API，带重试和错误处理"""
+    global total_cost, total_input_tokens, total_output_tokens
+    
     headers = {
         "Authorization": f"Bearer {API_KEY}",
         "Content-Type": "application/json"
@@ -397,10 +404,35 @@ def call_llm(prompt_sys: str, prompt_user: str, max_retries: int = 3, timeout: i
             
             logging.info(f"✅ LLM响应成功 - 输出长度: {len(content)} 字符")
             
-            # 记录token使用情况（如果可用）
+            # 记录token使用情况和计算成本
             if "usage" in result and result["usage"]:
                 usage = result["usage"]
-                logging.info(f"📊 Token使用: 输入{usage.get('prompt_tokens', 0)} + 输出{usage.get('completion_tokens', 0)} = 总计{usage.get('total_tokens', 0)}")
+                input_tokens = usage.get('prompt_tokens', 0)
+                output_tokens = usage.get('completion_tokens', 0)
+                total_tokens = usage.get('total_tokens', 0)
+                
+                # 累计token统计
+                total_input_tokens += input_tokens
+                total_output_tokens += output_tokens
+                
+                # 计算成本（如果启用了成本跟踪）
+                if CONFIG.get('pricing', {}).get('enable_cost_tracking', False):
+                    pricing = CONFIG.get('pricing', {})
+                    input_price_per_1k = pricing.get('input_price_per_1k_tokens', 0)
+                    output_price_per_1k = pricing.get('output_price_per_1k_tokens', 0)
+                    currency = pricing.get('currency', 'USD')
+                    
+                    batch_input_cost = (input_tokens / 1000) * input_price_per_1k
+                    batch_output_cost = (output_tokens / 1000) * output_price_per_1k
+                    batch_total_cost = batch_input_cost + batch_output_cost
+                    
+                    total_cost += batch_total_cost
+                    
+                    logging.info(f"📊 Token使用: 输入{input_tokens} + 输出{output_tokens} = 总计{total_tokens}")
+                    logging.info(f"💰 本次成本: {batch_total_cost:.4f} {currency} (输入: {batch_input_cost:.4f} + 输出: {batch_output_cost:.4f})")
+                    logging.info(f"💳 累计成本: {total_cost:.4f} {currency}")
+                else:
+                    logging.info(f"📊 Token使用: 输入{input_tokens} + 输出{output_tokens} = 总计{total_tokens}")
             
             return content.strip()
             
@@ -756,6 +788,9 @@ for batch_num in range(1, total_batches + 1):
             original_segments = len(re.findall(r'<c\d+>', tagged_eng))
             translated_segments = len(re.findall(r'<c\d+>', llm_out))
             
+            # 打印输出段落数和输入段落数对比
+            logging.info(f"📊 批次{batch_num}段落数量对比: 输入{original_segments}段 → 输出{translated_segments}段")
+            
             if abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
                 warning_msg = f"原文{original_segments}段 vs 译文{translated_segments}段"
                 logging.warning(f"批次{batch_num}段落数量差异较大: {warning_msg}")
@@ -890,7 +925,7 @@ try:
     if big_md_parts:
         # 添加文档头部
         header = f"""全文机翻  
-更多泰百小说见 `https://thaigl.drifting.boats/`
+更多泰百小说见 thaigl.drifting.boats
 
 ---
 
@@ -919,7 +954,20 @@ if missing_segments > 0:
 else:
     logging.info("🎉 所有段落翻译完成！")
 
-# 5. 生成重试脚本（如果有失败批次）
+# 5. 成本统计总结
+if CONFIG.get('pricing', {}).get('enable_cost_tracking', False):
+    pricing = CONFIG.get('pricing', {})
+    currency = pricing.get('currency', 'USD')
+    logging.info("=== 成本统计总结 ===")
+    logging.info(f"📊 总Token使用: 输入{total_input_tokens:,} + 输出{total_output_tokens:,} = 总计{total_input_tokens + total_output_tokens:,}")
+    logging.info(f"💰 总成本: {total_cost:.4f} {currency}")
+    if total_input_tokens > 0:
+        avg_cost_per_1k_input = (total_cost * 1000) / (total_input_tokens + total_output_tokens) if (total_input_tokens + total_output_tokens) > 0 else 0
+        logging.info(f"📈 平均成本: {avg_cost_per_1k_input:.4f} {currency}/1K tokens")
+else:
+    logging.info("📊 Token统计: 输入{:,} + 输出{:,} = 总计{:,}".format(total_input_tokens, total_output_tokens, total_input_tokens + total_output_tokens))
+
+# 6. 生成重试脚本（如果有失败批次）
 if failed_batches:
     try:
         retry_config = CONFIG.copy()

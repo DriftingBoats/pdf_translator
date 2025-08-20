@@ -5,6 +5,12 @@
     "LLM_MODEL": "gpt-4o",
     "temperature": 0.2
   },
+  "pricing": {
+    "input_price_per_1k_tokens": 0.0025,
+    "output_price_per_1k_tokens": 0.01,
+    "currency": "USD",
+    "enable_cost_tracking": true
+  },
   "paths": {
     "pdf": "path/to/your/document.pdf",
     "output_dir": "output/document_name",
@@ -34,6 +40,7 @@
   },
   "_comments": {
     "api_settings": "API配置 - 需要有效的OpenAI兼容API",
+    "pricing": "价格配置 - 用于估算LLM调用成本，价格单位为每1000个token",
     "paths": "文件路径配置 - pdf_path为输入文件，output_dir为输出目录",
     "output_structure": {
       "chap_md": "翻译结果的Markdown文件存储目录",
