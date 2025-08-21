@@ -266,31 +266,13 @@ setup_logging(verbose=CONFIG.get('verbose_logging', False))
 # 移除了detect_titles函数，现在由LLM负责识别标题和页眉页码
 
 def ensure_sentence_completion(text: str) -> str:
-    """确保文本以完整句子结束"""
-    text = text.strip()
-    if not text:
+    """简化的文本处理函数，不再截断内容，只做基本清理"""
+    if not text.strip():
         return text
     
-    # 检查是否以句号、问号、感叹号结尾
-    if text[-1] in '.!?':
-        return text
-    
-    # 查找最后一个完整句子的结束位置
-    last_sentence_end = -1
-    for i in range(len(text) - 1, -1, -1):
-        if text[i] in '.!?':
-            # 确保不是缩写（如Mr. Dr.等）
-            if i < len(text) - 1 and text[i+1] in ' \n\t':
-                last_sentence_end = i
-                break
-            elif i == len(text) - 1:
-                last_sentence_end = i
-                break
-    
-    if last_sentence_end > 0:
-        return text[:last_sentence_end + 1]
-    
-    return text
+    # 只移除末尾的空白字符，不进行任何截断
+    # 完全按照原文空行分段，避免在批次边界丢失内容
+    return text.rstrip()
 
 def wrap_batch_with_tags(raw_text: str) -> str:
     """把批次原文按空行分段，加 <c1>…</c1> 标签，让LLM自行识别标题和页眉页码"""
@@ -304,20 +286,25 @@ def wrap_batch_with_tags(raw_text: str) -> str:
     return "\n\n".join(tagged)
 
 def strip_tags(llm_output: str, keep_missing: bool = True):
-    """清洗 LLM 输出 & 收集缺失段"""
+    """清洗 LLM 输出 & 收集缺失段，优化页眉页脚识别逻辑"""
     paragraphs = TAG_PAT.findall(llm_output)
 
     miss_list, clean_paras = [], []
     for idx, p in enumerate(paragraphs, start=1):
-        if p.strip() == "{{MISSING}}":
+        content = p.strip()
+        
+        if content == "{{MISSING}}":
             miss_list.append(f"c{idx:03d}")
             if keep_missing:
                 clean_paras.append("{{MISSING}}")
-        elif p.strip() == "" or p.strip().startswith("[页眉页脚]") or p.strip().startswith("[目录]"):  # 处理空标签和特殊标记
-            # 跳过空内容和页眉页脚、目录标记，不添加到clean_paras中
+        elif content == "":
+            # 跳过完全空的内容
+            pass
+        elif _is_header_footer_content(content):
+            # 使用更智能的页眉页脚识别逻辑
             pass
         else:
-            clean_paras.append(p.strip())
+            clean_paras.append(content)
 
     # 过滤掉空字符串，避免多余的空行
     clean_paras = [para for para in clean_paras if para.strip()]
@@ -328,6 +315,39 @@ def strip_tags(llm_output: str, keep_missing: bool = True):
         for line in blk.strip().splitlines() if line.strip()
     )
     return pure_text, new_terms_block, miss_list
+
+def _is_header_footer_content(content: str) -> bool:
+    """智能识别页眉页脚内容，避免误判正常文本"""
+    # 明确的页眉页脚标记
+    if content.startswith("[页眉页脚]") or content.startswith("[目录]"):
+        return True
+    
+    # 页码模式（更严格的匹配）
+    page_patterns = [
+        r'^Page\s+\d+\s+of\s+\d+$',  # "Page 1 of 506"
+        r'^第\d+页/共\d+页$',        # "第1页/共506页"
+        r'^\d+\s*/\s*\d+$',         # "1/506"
+        r'^\d+$'                    # 单独的数字（但要小心，可能是正文）
+    ]
+    
+    for pattern in page_patterns:
+        if re.match(pattern, content.strip(), re.IGNORECASE):
+            return True
+    
+    # 网址和邮箱模式
+    if re.search(r'https?://|www\.|@.*\.(com|org|net)', content, re.IGNORECASE):
+        return True
+    
+    # 版权信息
+    if re.search(r'copyright|©|版权所有|all rights reserved', content, re.IGNORECASE):
+        return True
+    
+    # 作者信息重复（但要谨慎，避免误判正文中的作者名）
+    # 只有当内容很短且看起来像重复的作者信息时才判断为页眉页脚
+    if len(content) < 50 and re.search(r'^(author|作者)[:：]?\s*[A-Za-z\s]+$', content, re.IGNORECASE):
+        return True
+    
+    return False
 
 def refresh_style(sample_text: str):
     """若 style_cache 为空，则用原文样本让 LLM 归纳风格；否则跳过"""
@@ -628,21 +648,8 @@ for batch_num in range(1, total_batches + 1):
             log_progress(processed_batches, total_batches, "批次进度", "内容为空")
             continue
         
-        # 检查句子完整性，如果不是最后一批且句子未完整，尝试扩展
-        if batch_num < total_batches:
-            # 检查是否需要扩展到下一页以完成句子
-            completed_text = ensure_sentence_completion(raw_eng)
-            if len(completed_text) < len(raw_eng) * 0.8:  # 如果截断太多，尝试扩展
-                if p_end < total_pages:
-                    # 添加下一页的部分内容直到句子完整
-                    next_page_text = pages[p_end] if p_end < len(pages) else ""
-                    extended_text = raw_eng + "\n" + next_page_text
-                    completed_extended = ensure_sentence_completion(extended_text)
-                    if len(completed_extended) > len(completed_text):
-                        raw_eng = completed_extended
-                        logging.info(f"📝 批次{batch_num}扩展到下一页以完成句子")
-            else:
-                raw_eng = completed_text
+        # 不再进行句子完整性截断，完全按照原文空行分段
+        # 这样可以避免在批次边界丢失内容，让LLM处理完整的段落
         
         tagged_eng = wrap_batch_with_tags(raw_eng)
         
@@ -692,9 +699,12 @@ for batch_num in range(1, total_batches + 1):
             • 你必须为 *每一个* <cN> 段落输出对应 <cN> 段落，保持顺序一致。  
             • 绝不可合并、增删或跳过段落。若确实无法翻译，原文用 <cN>{{{{MISSING}}}}</cN> 原样抄写。
 
-            2. **不省略**  
+            2. **不省略**（极其重要！）  
             • 译文行数 ≈ 源行数。  
+            • **必须翻译每一个段落**：特别注意最后一个段落，绝不能遗漏！
+            • **强制完整性检查**：翻译完成后，必须检查是否所有 <cN> 段落都有对应输出。
             • 结尾自行执行检查：若发现有未输出的 <cX> 段，必须补上 <cX>{{{{MISSING}}}}</cX>。
+            • **最后一段特别提醒**：最后一个段落往往容易被遗漏，请务必确保翻译完整！
 
             3. **智能识别与处理**（重要！）
             • **页眉页脚标记**：遇到以下内容输出特殊标记 <cN>[页眉页脚]</cN>：
@@ -784,17 +794,32 @@ for batch_num in range(1, total_batches + 1):
             if not cn_body.strip():
                 raise ValueError("翻译结果为空")
             
-            # 检查段落数量是否合理
+            # 强化完整性检查
             original_segments = len(re.findall(r'<c\d+>', tagged_eng))
             translated_segments = len(re.findall(r'<c\d+>', llm_out))
             
-            # 打印输出段落数和输入段落数对比
+            # 检查每个输入段落是否都有对应的输出
+            input_tags = set(re.findall(r'<c(\d+)>', tagged_eng))
+            output_tags = set(re.findall(r'<c(\d+)>', llm_out))
+            missing_tags = input_tags - output_tags
+            
+            # 打印详细的段落对比信息
             logging.info(f"📊 批次{batch_num}段落数量对比: 输入{original_segments}段 → 输出{translated_segments}段")
             
-            if abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
+            if missing_tags:
+                missing_list = sorted([int(tag) for tag in missing_tags])
+                logging.error(f"🚨 批次{batch_num}发现遗漏段落: c{missing_list}")
+                # 将遗漏的段落添加到缺失列表
+                for tag_num in missing_list:
+                    if f"c{tag_num:03d}" not in miss:
+                        miss.append(f"c{tag_num:03d}")
+                WARNING_DICT[batch_id] = f"遗漏段落: c{missing_list}"
+            elif abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
                 warning_msg = f"原文{original_segments}段 vs 译文{translated_segments}段"
                 logging.warning(f"批次{batch_num}段落数量差异较大: {warning_msg}")
                 WARNING_DICT[batch_id] = warning_msg
+            else:
+                logging.info(f"✅ 批次{batch_num}段落完整性检查通过")
             
         except Exception as e:
             logging.error(f"批次{batch_num}结果解析失败: {e}")
