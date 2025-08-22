@@ -265,14 +265,62 @@ setup_logging(verbose=CONFIG.get('verbose_logging', False))
 # ========= 辅助函数 ========= #
 # 移除了detect_titles函数，现在由LLM负责识别标题和页眉页码
 
-def ensure_sentence_completion(text: str) -> str:
-    """简化的文本处理函数，不再截断内容，只做基本清理"""
+def ensure_sentence_completion(text: str, next_batch_text: str = "") -> str:
+    """智能句子完整性处理：如果当前batch最后一句没有结束，只补充完整这个半句"""
     if not text.strip():
         return text
     
-    # 只移除末尾的空白字符，不进行任何截断
-    # 完全按照原文空行分段，避免在批次边界丢失内容
-    return text.rstrip()
+    # 移除末尾空白字符
+    text = text.rstrip()
+    
+    # 如果没有下一批次内容，直接返回
+    if not next_batch_text.strip():
+        return text
+    
+    # 检查最后一句是否完整（以句号、问号、感叹号、引号等结束）
+    sentence_endings = r'[.!?"\'\'\"\)\]\}]\s*$'
+    
+    # 如果最后一句已经完整，直接返回
+    if re.search(sentence_endings, text):
+        return text
+    
+    # 如果最后一句没有完整，从下一批次中找到句子结束位置
+    next_text = next_batch_text.strip()
+    
+    # 优先根据空行（段落边界）查找句子结束位置
+    # 首先查找第一个空行（双换行符），这通常表示段落结束
+    paragraph_end_match = re.search(r'\n\s*\n', next_text)
+    
+    if paragraph_end_match:
+        # 找到段落结束位置，补充到段落结束
+        end_pos = paragraph_end_match.start()
+        completion = next_text[:end_pos].rstrip()
+        
+        # 记录补充的内容长度，用于日志
+        logging.info(f"📝 检测到未完整句子，根据段落边界补充 {len(completion)} 个字符完成句子")
+        
+        return text + completion
+    else:
+        # 如果没有找到段落边界，再查找标点符号结束位置
+        sentence_end_match = re.search(r'[.!?"\'\'\"\)\]\}]', next_text)
+        
+        if sentence_end_match:
+            # 找到句子结束位置，只补充到句子结束
+            end_pos = sentence_end_match.end()
+            completion = next_text[:end_pos]
+            
+            # 记录补充的内容长度，用于日志
+            logging.info(f"📝 检测到未完整句子，根据标点符号补充 {len(completion)} 个字符完成句子")
+            
+            return text + completion
+        else:
+            # 如果都没有找到，只补充一小部分内容（最多100字符）
+            max_supplement = min(100, len(next_text))
+            completion = next_text[:max_supplement]
+            
+            logging.info(f"📝 未找到明确句子结束，补充 {len(completion)} 个字符")
+            
+            return text + completion
 
 def wrap_batch_with_tags(raw_text: str) -> str:
     """把批次原文按空行分段，加 <c1>…</c1> 标签，让LLM自行识别标题和页眉页码"""
@@ -648,8 +696,19 @@ for batch_num in range(1, total_batches + 1):
             log_progress(processed_batches, total_batches, "批次进度", "内容为空")
             continue
         
-        # 不再进行句子完整性截断，完全按照原文空行分段
-        # 这样可以避免在批次边界丢失内容，让LLM处理完整的段落
+        # 智能句子完整性处理：如果当前批次最后一句没有结束，从下一批次补充完整
+        if batch_num < total_batches:  # 不是最后一个批次
+            # 获取下一批次的文本用于句子完整性检查
+            next_p_start = batch_num * PAGES_PER_BATCH + 1
+            next_p_end = min((batch_num + 1) * PAGES_PER_BATCH, total_pages)
+            try:
+                next_batch_text = get_batch_text_with_cache(pages, batch_num + 1, next_p_start, next_p_end, RAW_CONTENT_DIR)
+                # 应用智能句子完整性处理
+                raw_eng = ensure_sentence_completion(raw_eng, next_batch_text)
+            except Exception as e:
+                logging.warning(f"获取下一批次文本失败，跳过句子完整性处理: {e}")
+                # 如果获取下一批次失败，仍然使用原始文本
+                raw_eng = ensure_sentence_completion(raw_eng)
         
         tagged_eng = wrap_batch_with_tags(raw_eng)
         
@@ -796,7 +855,8 @@ for batch_num in range(1, total_batches + 1):
             
             # 强化完整性检查
             original_segments = len(re.findall(r'<c\d+>', tagged_eng))
-            translated_segments = len(re.findall(r'<c\d+>', llm_out))
+            # 计算最终译文的段落数（基于清洗后的内容）
+            translated_segments = len([p for p in cn_body.split('\n\n') if p.strip()])
             
             # 检查每个输入段落是否都有对应的输出
             input_tags = set(re.findall(r'<c(\d+)>', tagged_eng))
@@ -816,8 +876,12 @@ for batch_num in range(1, total_batches + 1):
                 WARNING_DICT[batch_id] = f"遗漏段落: c{missing_list}"
             elif abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
                 warning_msg = f"原文{original_segments}段 vs 译文{translated_segments}段"
-                logging.warning(f"批次{batch_num}段落数量差异较大: {warning_msg}")
+                logging.warning(f"⚠️  批次{batch_num}段落数量差异较大: {warning_msg}")
                 WARNING_DICT[batch_id] = warning_msg
+            elif original_segments != translated_segments:
+                # 打印所有段落数量不一致的情况，即使差异在允许范围内
+                diff_msg = f"原文{original_segments}段 vs 译文{translated_segments}段"
+                logging.info(f"ℹ️  批次{batch_num}段落数量不一致: {diff_msg}")
             else:
                 logging.info(f"✅ 批次{batch_num}段落完整性检查通过")
             

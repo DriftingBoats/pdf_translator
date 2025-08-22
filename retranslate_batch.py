@@ -175,13 +175,16 @@ def find_diff_batches(output_dir: Path, threshold: float = 0.2) -> List[int]:
         try:
             # 读取翻译结果
             translated_content = batch_file.read_text(encoding='utf-8')
-            translated_segments = count_segments(translated_content)
+            # 对于已翻译的内容，按段落分割计算（与最终输出一致）
+            translated_segments = len([p for p in translated_content.split('\n\n') if p.strip()])
             
             # 读取原始文本
-            raw_file = raw_content_dir / f"batch_{batch_num:03d}.txt"
+            raw_file = raw_content_dir / f"batch_{batch_num:03d}_raw_text.txt"
             if raw_file.exists():
                 raw_content = raw_file.read_text(encoding='utf-8')
-                original_segments = count_segments(raw_content)
+                # 使用与translator.py相同的方式计算段落数
+                tagged_content = wrap_batch_with_tags(raw_content)
+                original_segments = count_segments(tagged_content)
                 
                 # 计算差异比例
                 if original_segments > 0:
@@ -251,7 +254,7 @@ def retranslate_batch(batch_num: int, config: dict, output_dir: str, glossary: D
     chap_dir = output_path / "chap_md"
     
     # 读取原始文本
-    raw_file = raw_content_dir / f"batch_{batch_num:03d}.txt"
+    raw_file = raw_content_dir / f"batch_{batch_num:03d}_raw_text.txt"
     if not raw_file.exists():
         logging.error(f"❌ 批次 {batch_num} 原始文件不存在")
         return False
@@ -308,8 +311,8 @@ def retranslate_batch(batch_num: int, config: dict, output_dir: str, glossary: D
         if not cn_body.strip():
             raise ValueError("翻译结果为空")
         
-        # 检查段落数量是否合理
-        translated_segments = len(re.findall(r'<c\d+>', llm_output))
+        # 检查段落数量是否合理 - 使用清洗后的内容计算段落数（与find_diff_batches一致）
+        translated_segments = len([p for p in cn_body.split('\n\n') if p.strip()])
         logging.info(f"📊 批次{batch_num}段落数量对比: 输入{original_segments}段 → 输出{translated_segments}段")
         
         if abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异

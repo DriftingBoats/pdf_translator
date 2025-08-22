@@ -199,7 +199,8 @@ def analyze_batch_differences(output_dir: Path) -> List[Tuple[int, str, int, int
         # 读取翻译结果
         try:
             translated_content = batch_file.read_text(encoding='utf-8')
-            translated_segments = count_segments(translated_content)
+            # 对于已翻译的内容，按段落分割计算（与translator.py中最终输出一致）
+            translated_segments = len([p for p in translated_content.split('\n\n') if p.strip()])
         except Exception as e:
             logging.warning(f"读取批次 {batch_num} 翻译文件失败: {e}")
             continue
@@ -340,14 +341,14 @@ def retranslate_batch(batch_num: int, config: dict, output_dir: Path, glossary: 
         # 调用LLM进行翻译
         translated_content = call_llm(system_prompt, tagged_content, config)
         
-        # 验证翻译结果
-        translated_segments = count_segments(translated_content)
+        # 清洗输出并去除标签
+        cn_body, new_terms_block, miss_list = strip_tags(translated_content, keep_missing=True)
+        
+        # 验证翻译结果 - 使用清洗后的内容计算段落数（与analyze_batch_differences一致）
+        translated_segments = len([p for p in cn_body.split('\n\n') if p.strip()])
         
         # 打印输出段落数和输入段落数对比
         logging.info(f"📊 批次{batch_num}段落数量对比: 输入{original_segments}段 → 输出{translated_segments}段")
-        
-        # 清洗输出并去除标签
-        cn_body, new_terms_block, miss_list = strip_tags(translated_content, keep_missing=True)
         
         # 验证翻译质量
         if not cn_body.strip():

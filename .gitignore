@@ -1,3 +1,6 @@
 _DS_Store
 output/
 .DS_Store
+*.log
+achieve/
+__pycache__
