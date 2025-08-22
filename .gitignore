@@ -4,3 +4,4 @@ output/
 *.log
 achieve/
 __pycache__
+pdf-translator-web/
