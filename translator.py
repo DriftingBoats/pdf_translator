@@ -264,32 +264,62 @@ setup_logging(verbose=CONFIG.get('verbose_logging', False))
 # ========= 辅助函数 ========= #
 # 移除了detect_titles函数，现在由LLM负责识别标题和页眉页码
 
-def ensure_sentence_completion(text: str) -> str:
-    """确保文本以完整句子结束"""
-    text = text.strip()
-    if not text:
+def ensure_sentence_completion(text: str, next_batch_text: str = "") -> str:
+    """智能句子完整性处理：如果当前batch最后一句没有结束，只补充完整这个半句"""
+    if not text.strip():
         return text
     
-    # 检查是否以句号、问号、感叹号结尾
-    if text[-1] in '.!?':
+    # 移除末尾空白字符
+    text = text.rstrip()
+    
+    # 如果没有下一批次内容，直接返回
+    if not next_batch_text.strip():
         return text
     
-    # 查找最后一个完整句子的结束位置
-    last_sentence_end = -1
-    for i in range(len(text) - 1, -1, -1):
-        if text[i] in '.!?':
-            # 确保不是缩写（如Mr. Dr.等）
-            if i < len(text) - 1 and text[i+1] in ' \n\t':
-                last_sentence_end = i
-                break
-            elif i == len(text) - 1:
-                last_sentence_end = i
-                break
+    # 检查最后一句是否完整（以句号、问号、感叹号、引号等结束）
+    sentence_endings = r'[.!?"\'\'\"\)\]\}]\s*$'
     
-    if last_sentence_end > 0:
-        return text[:last_sentence_end + 1]
+    # 如果最后一句已经完整，直接返回
+    if re.search(sentence_endings, text):
+        return text
     
-    return text
+    # 如果最后一句没有完整，从下一批次中找到句子结束位置
+    next_text = next_batch_text.strip()
+    
+    # 优先根据空行（段落边界）查找句子结束位置
+    # 首先查找第一个空行（双换行符），这通常表示段落结束
+    paragraph_end_match = re.search(r'\n\s*\n', next_text)
+    
+    if paragraph_end_match:
+        # 找到段落结束位置，补充到段落结束
+        end_pos = paragraph_end_match.start()
+        completion = next_text[:end_pos].rstrip()
+        
+        # 记录补充的内容长度，用于日志
+        logging.info(f"📝 检测到未完整句子，根据段落边界补充 {len(completion)} 个字符完成句子")
+        
+        return text + completion
+    else:
+        # 如果没有找到段落边界，再查找标点符号结束位置
+        sentence_end_match = re.search(r'[.!?"\'\'\"\)\]\}]', next_text)
+        
+        if sentence_end_match:
+            # 找到句子结束位置，只补充到句子结束
+            end_pos = sentence_end_match.end()
+            completion = next_text[:end_pos]
+            
+            # 记录补充的内容长度，用于日志
+            logging.info(f"📝 检测到未完整句子，根据标点符号补充 {len(completion)} 个字符完成句子")
+            
+            return text + completion
+        else:
+            # 如果都没有找到，只补充一小部分内容（最多100字符）
+            max_supplement = min(100, len(next_text))
+            completion = next_text[:max_supplement]
+            
+            logging.info(f"📝 未找到明确句子结束，补充 {len(completion)} 个字符")
+            
+            return text + completion
 
 def wrap_batch_with_tags(raw_text: str) -> str:
     """把批次原文按空行分段，加 <c1>…</c1> 标签，让LLM自行识别标题和页眉页码"""
@@ -303,26 +333,64 @@ def wrap_batch_with_tags(raw_text: str) -> str:
     return "\n\n".join(tagged)
 
 def strip_tags(llm_output: str, keep_missing: bool = True):
-    """清洗 LLM 输出 & 收集缺失段"""
+    """清洗 LLM 输出 & 收集缺失段，优化页眉页脚识别逻辑"""
     paragraphs = TAG_PAT.findall(llm_output)
 
     miss_list, clean_paras = [], []
     for idx, p in enumerate(paragraphs, start=1):
-        if p.strip() == "{{MISSING}}":
+        content = p.strip()
+        
+        if content == "{{MISSING}}":
             miss_list.append(f"c{idx:03d}")
             if keep_missing:
                 clean_paras.append("{{MISSING}}")
-        elif p.strip() == "" or p.strip().startswith("[页眉页脚]") or p.strip().startswith("[目录]"):  # 处理空标签和特殊标记
-            # 跳过空内容和页眉页脚、目录标记，不添加到clean_paras中
+        elif content == "":
+            # 跳过完全空的内容
+            pass
+        elif _is_header_footer_content(content):
+            # 使用更智能的页眉页脚识别逻辑
             pass
         else:
-            clean_paras.append(p.strip())
+            clean_paras.append(content)
 
     # 过滤掉空字符串，避免多余的空行
     clean_paras = [para for para in clean_paras if para.strip()]
     pure_text = "\n\n".join(clean_paras)
     # 术语表功能已移除，不再处理术语表内容
     return pure_text, "", miss_list
+
+def _is_header_footer_content(content: str) -> bool:
+    """智能识别页眉页脚内容，避免误判正常文本"""
+    # 明确的页眉页脚标记
+    if content.startswith("[页眉页脚]") or content.startswith("[目录]"):
+        return True
+    
+    # 页码模式（更严格的匹配）
+    page_patterns = [
+        r'^Page\s+\d+\s+of\s+\d+$',  # "Page 1 of 506"
+        r'^第\d+页/共\d+页$',        # "第1页/共506页"
+        r'^\d+\s*/\s*\d+$',         # "1/506"
+        r'^\d+$'                    # 单独的数字（但要小心，可能是正文）
+    ]
+    
+    for pattern in page_patterns:
+        if re.match(pattern, content.strip(), re.IGNORECASE):
+            return True
+    
+    # 网址和邮箱模式
+    if re.search(r'https?://|www\.|@.*\.(com|org|net)', content, re.IGNORECASE):
+        return True
+    
+    # 版权信息
+    if re.search(r'copyright|©|版权所有|all rights reserved', content, re.IGNORECASE):
+        return True
+    
+    # 作者信息重复（但要谨慎，避免误判正文中的作者名）
+    # 只有当内容很短且看起来像重复的作者信息时才判断为页眉页脚
+    if len(content) < 50 and re.search(r'^(author|作者)[:：]?\s*[A-Za-z\s]+$', content, re.IGNORECASE):
+        return True
+    
+    return False
 
 def refresh_style(sample_text: str):
     """若 style_cache 为空，则用原文样本让 LLM 归纳风格；否则跳过"""
@@ -608,21 +676,19 @@ for batch_num in range(1, total_batches + 1):
             log_progress(processed_batches, total_batches, "批次进度", "内容为空")
             continue
         
-        # 检查句子完整性，如果不是最后一批且句子未完整，尝试扩展
-        if batch_num < total_batches:
-            # 检查是否需要扩展到下一页以完成句子
-            completed_text = ensure_sentence_completion(raw_eng)
-            if len(completed_text) < len(raw_eng) * 0.8:  # 如果截断太多，尝试扩展
-                if p_end < total_pages:
-                    # 添加下一页的部分内容直到句子完整
-                    next_page_text = pages[p_end] if p_end < len(pages) else ""
-                    extended_text = raw_eng + "\n" + next_page_text
-                    completed_extended = ensure_sentence_completion(extended_text)
-                    if len(completed_extended) > len(completed_text):
-                        raw_eng = completed_extended
-                        logging.info(f"📝 批次{batch_num}扩展到下一页以完成句子")
-            else:
-                raw_eng = completed_text
+        # 智能句子完整性处理：如果当前批次最后一句没有结束，从下一批次补充完整
+        if batch_num < total_batches:  # 不是最后一个批次
+            # 获取下一批次的文本用于句子完整性检查
+            next_p_start = batch_num * PAGES_PER_BATCH + 1
+            next_p_end = min((batch_num + 1) * PAGES_PER_BATCH, total_pages)
+            try:
+                next_batch_text = get_batch_text_with_cache(pages, batch_num + 1, next_p_start, next_p_end, RAW_CONTENT_DIR)
+                # 应用智能句子完整性处理
+                raw_eng = ensure_sentence_completion(raw_eng, next_batch_text)
+            except Exception as e:
+                logging.warning(f"获取下一批次文本失败，跳过句子完整性处理: {e}")
+                # 如果获取下一批次失败，仍然使用原始文本
+                raw_eng = ensure_sentence_completion(raw_eng)
         
         tagged_eng = wrap_batch_with_tags(raw_eng)
         
@@ -692,7 +758,7 @@ for batch_num in range(1, total_batches + 1):
                - 全大写的短行（如"PROLOGUE"、"EPILOGUE"） → ## 标题 
                - 带有装饰性符号的标题（如"☘ 01.我忍不了了 ☘"）→ 去掉左右符号后转换为 ## 01.我忍不了了 
             • **特殊内容处理**： 
-              - 作者的话、前言、后记等 → ## 作者的话 
+              - 作者的话、前言、后记等 → ## 作者的话
               - 目录、索引等 → [目录]
 
             4. **专有名词和称呼处理**（重要！）  
@@ -764,17 +830,37 @@ for batch_num in range(1, total_batches + 1):
             if not cn_body.strip():
                 raise ValueError("翻译结果为空")
             
-            # 检查段落数量是否合理
+            # 强化完整性检查
             original_segments = len(re.findall(r'<c\d+>', tagged_eng))
-            translated_segments = len(re.findall(r'<c\d+>', llm_out))
+            # 计算最终译文的段落数（基于清洗后的内容）
+            translated_segments = len([p for p in cn_body.split('\n\n') if p.strip()])
             
-            # 打印输出段落数和输入段落数对比
+            # 检查每个输入段落是否都有对应的输出
+            input_tags = set(re.findall(r'<c(\d+)>', tagged_eng))
+            output_tags = set(re.findall(r'<c(\d+)>', llm_out))
+            missing_tags = input_tags - output_tags
+            
+            # 打印详细的段落对比信息
             logging.info(f"📊 批次{batch_num}段落数量对比: 输入{original_segments}段 → 输出{translated_segments}段")
             
-            if abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
+            if missing_tags:
+                missing_list = sorted([int(tag) for tag in missing_tags])
+                logging.error(f"🚨 批次{batch_num}发现遗漏段落: c{missing_list}")
+                # 将遗漏的段落添加到缺失列表
+                for tag_num in missing_list:
+                    if f"c{tag_num:03d}" not in miss:
+                        miss.append(f"c{tag_num:03d}")
+                WARNING_DICT[batch_id] = f"遗漏段落: c{missing_list}"
+            elif abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
                 warning_msg = f"原文{original_segments}段 vs 译文{translated_segments}段"
-                logging.warning(f"批次{batch_num}段落数量差异较大: {warning_msg}")
+                logging.warning(f"⚠️  批次{batch_num}段落数量差异较大: {warning_msg}")
                 WARNING_DICT[batch_id] = warning_msg
+            elif original_segments != translated_segments:
+                # 打印所有段落数量不一致的情况，即使差异在允许范围内
+                diff_msg = f"原文{original_segments}段 vs 译文{translated_segments}段"
+                logging.info(f"ℹ️  批次{batch_num}段落数量不一致: {diff_msg}")
+            else:
+                logging.info(f"✅ 批次{batch_num}段落完整性检查通过")
             
         except Exception as e:
             logging.error(f"批次{batch_num}结果解析失败: {e}")

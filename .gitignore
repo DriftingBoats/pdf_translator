@@ -1,4 +1,7 @@
 _DS_Store
 output/
 .DS_Store
+*.log
 achieve/
+__pycache__
+pdf-translator-web/
