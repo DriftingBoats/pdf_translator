@@ -7,7 +7,7 @@ page_batch_translation_agent_cn.py
   • 处理句子完整性，确保翻译至句子结束
   • 自动识别标题并保持格式
   • 自动编号并最终整合为一个文件
-  • 增量更新术语表 glossary.tsv
+  • 使用prompt约束专有名词处理
 """
 import json, re, textwrap, logging, time, datetime, requests, os, sys, warnings, random
 from pathlib import Path
@@ -163,7 +163,6 @@ BIG_MD_NAME  = CONFIG["paths"]["big_md_name"]
 
 # 新增配置项：每批处理的页数
 PAGES_PER_BATCH = CONFIG.get("pages_per_batch", 10)  # 默认每10页翻译一次
-GLOSS_CFG    = CONFIG.get("glossary", {})
 
 # 验证PDF文件存在
 if not PDF_PATH.exists():
@@ -184,7 +183,7 @@ if STYLE_FILE.exists():
 # ========= 常量 ========= #
 HEAD_SEP  = "\n" + ("─"*80) + "\n"
 TAG_PAT   = re.compile(r"<c\d+>(.*?)</c\d+>", re.S)
-NEWTERM_PAT = re.compile(r"```glossary(.*?)```", re.S)
+# NEWTERM_PAT已移除，不再处理术语表
 
 # ========= 日志配置 ========= #
 class ColoredFormatter(logging.Formatter):
@@ -322,12 +321,8 @@ def strip_tags(llm_output: str, keep_missing: bool = True):
     # 过滤掉空字符串，避免多余的空行
     clean_paras = [para for para in clean_paras if para.strip()]
     pure_text = "\n\n".join(clean_paras)
-    new_terms_block = "\n".join(
-        line.strip()
-        for blk in NEWTERM_PAT.findall(llm_output)
-        for line in blk.strip().splitlines() if line.strip()
-    )
-    return pure_text, new_terms_block, miss_list
+    # 术语表功能已移除，不再处理术语表内容
+    return pure_text, "", miss_list
 
 def refresh_style(sample_text: str):
     """若 style_cache 为空，则用原文样本让 LLM 归纳风格；否则跳过"""
@@ -353,19 +348,7 @@ def refresh_style(sample_text: str):
         logging.error(f"风格分析失败: {e}")
         style_cache = "默认风格：保持原文的叙事节奏和语调"
 
-def load_glossary(path: Path) -> Dict[str, str]:
-    if not path.exists():
-        return {}
-    out = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if "\t" in line:
-            src, tgt = line.split("\t", 1)
-            out[src.strip()] = tgt.strip()
-    return out
-
-def save_glossary(gls: Dict[str,str], path: Path):
-    lines = [f"{k}\t{v}" for k, v in sorted(gls.items())]
-    path.write_text("\n".join(lines), encoding="utf-8")
+# 术语表相关函数已移除，不再使用术语表功能
 
 def call_llm(prompt_sys: str, prompt_user: str, max_retries: int = 3, timeout: int = 120) -> str:
     """调用LLM API，带重试和错误处理"""
@@ -476,11 +459,8 @@ if CONFIG.get("clean_cache_on_start", True):
     logging.info("=== 检查并清理过期缓存文件 ===")
     clean_cache_files(RAW_CONTENT_DIR, PDF_PATH, force=False)
 
-gloss_path = OUT_DIR / "glossary.tsv"
-GLOSSARY = load_glossary(gloss_path)
-# 预置：config 中声明的词汇，优先级最高
-GLOSSARY.update(GLOSS_CFG)
-logging.info(f"术语表已加载，共{len(GLOSSARY)}个条目")
+# 术语表功能已移除，不再使用术语表
+logging.info("术语表功能已禁用，使用prompt约束专有名词处理")
 
 # ========= 解析整本 PDF（带缓存优化）========= #
 def get_pdf_text_with_cache(pdf_path: Path, cache_dir: Path) -> str:
@@ -682,9 +662,8 @@ for batch_num in range(1, total_batches + 1):
             refresh_style(sample_text)
         
         # --- 构造系统提示 ---
-        gloss_block = "\n".join(f"{k}\t{v}" for k,v in GLOSSARY.items())
         system_prompt = textwrap.dedent( f"""
-            你是一名 <资深文学译者>，需把下方【泰语→英译→中文】的英文小说精准、逐句地译成现代中文。
+            你是一名资深文学译者，需把下方英文小说精准、逐句地译成现代中文。
 
             ================ 任务要求 ================
             1. **逐段落对齐**  
@@ -692,66 +671,67 @@ for batch_num in range(1, total_batches + 1):
             • 你必须为 *每一个* <cN> 段落输出对应 <cN> 段落，保持顺序一致。  
             • 绝不可合并、增删或跳过段落。若确实无法翻译，原文用 <cN>{{{{MISSING}}}}</cN> 原样抄写。
 
-            2. **不省略**  
+            2. **不省略**（极其重要！）  
             • 译文行数 ≈ 源行数。  
-            • 结尾自行执行检查：若发现有未输出的 <cX> 段，必须补上 <cX>{{{{MISSING}}}}</cX>。
+            • **必须翻译每一个段落**：特别注意最后一个段落，绝不能遗漏！ 
+            • **强制完整性检查**：翻译完成后，必须检查是否所有 <cN> 段落都有对应输出。 
+            • 结尾自行执行检查：若发现有未输出的 <cX> 段，必须补上 <cX>{{{{MISSING}}}}</cX>。 
+            • **最后一段特别提醒**：最后一个段落往往容易被遗漏，请务必确保翻译完整！
 
-            3. **智能识别与处理**（重要！）
-            • **页眉页脚标记**：遇到以下内容输出特殊标记 <cN>[页眉页脚]</cN>：
-              - 页码信息（如"Page 1 of 506"、"第1页/共506页"等）
-              - 作者信息重复（如邮箱地址、作者名重复出现）
-              - 网站链接、版权信息
-              - 明显的页眉页脚重复内容
-            • **章节标题识别**：识别以下内容并转换为Markdown格式：
-              - 章节标题 → ## 标题
-              - 小节标题 → ### 标题  
-              - "Chapter X"、"第X章" → ## 第X章
-              - 居中的短标题 → ### 标题
-            • **特殊内容处理**：
-              - 作者的话、前言、后记等 → ## 作者的话
+            3. **智能识别与处理**（重要！） 
+            • **页眉页脚标记**：遇到以下内容输出特殊标记 <cN>[页眉页脚]</cN>： 
+              - 页码信息（如"Page 1 of 506"、"第1页/共506页"等） 
+              - 作者信息重复（如邮箱地址、作者名重复出现） 
+              - 网站链接、版权信息 
+              - 明显的页眉页脚重复内容 
+            • **章节标题识别**：识别以下内容并转换为Markdown格式（统一使用二级标题##）： 
+               - "Chapter X"、"第X章"、"第01章"、"第一章" → ## 第X章 
+               - "01."、"1."、"一、"等编号开头的标题 → ## 01. 标题 
+               - "番外01."、"特别篇01." → ## 番外01. 标题、## 特别篇01. 标题 
+               - 居中的短标题 → ## 标题 
+               - 全大写的短行（如"PROLOGUE"、"EPILOGUE"） → ## 标题 
+               - 带有装饰性符号的标题（如"☘ 01.我忍不了了 ☘"）→ 去掉左右符号后转换为 ## 01.我忍不了了 
+            • **特殊内容处理**： 
+              - 作者的话、前言、后记等 → ## 作者的话 
               - 目录、索引等 → [目录]
 
-            4. **术语表**（glossary）  
-            • 见下方《术语表》；若词条已列出，则在译文原样保留，不得译。  
-            • 如遇新专有名词（人名、地名、品牌名等）：**在译文中保持原词不翻译，并在 ```glossary``` 中按格式 原词⇢原词 标记**，脚本后续会增量写入术语表。
-            • 注意：专有名词应保持原文，不要翻译成中文。
+            4. **专有名词和称呼处理**（重要！）  
+            • **人名保持原文**：所有人名（如 John、Mary、Somchai 等）保持英文原文，不要翻译成中文。 
+            • **泰语称呼保持原文**：以下泰语称呼词汇必须保持原文，不要翻译： 
+              - Khun（คุณ）- 敬语称呼，相当于先生/女士 
+              - P'（พี่）- 对年长者的称呼，哥哥/姐姐 
+              - N'（น้อง）- 对年幼者的称呼，弟弟/妹妹 
+              - Phi（พี่）- P'的完整形式 
+              - Nong（น้อง）- N'的完整形式 
+              - Ajarn（อาจารย์）- 老师、教授 
+              - Krub/Krab（ครับ）- 男性敬语语尾词 
+              - Ka/Kha（ค่ะ/คะ）- 女性敬语语尾词 
+            • **品牌名保持原文**：品牌名称保持原文不翻译。
 
             5. **风格守则**  
-            • 保持原文风格特征：{style_cache}
-            • **第三人称改第一人称**：泰语转译中常见用第三人称称呼自己的对话，必须改成第一人称以符合中文阅读习惯（此规则优先级高于术语表保留原词）。
+            • 保持原文风格特征：{style_cache} 
+            • **第三人称改第一人称**：泰语转译中常见用第三人称称呼自己的对话，必须改成第一人称以符合中文阅读习惯。 
             • **标点规范**：用中文标点，英文专名内部保留半角。禁止出现多个连续句号（如。。。、.。。。、.。.等），统一使用省略号……。  
-            • 数字、计量单位、货币符号照原文。
+            • 数字、计量单位、货币符号照原文。 
             • 保持原文的叙事节奏、语调和情感表达方式。
 
-            =============== 术语表（供参考） ===============
-            {gloss_block}
+            ===== 输出格式示例 ===== 
+            输入： 
+            <c1>Page 1 of 506</c1> 
+            <c2>Khun Somchai said to P'Niran</c2> 
+            <c3>Chapter 1: The Beginning</c3> 
+            <c4>"I love you," John whispered to Mary.</c4>
 
-            ===== 输出格式示例 =====
-            输入：
-            <c1>Page 1 of 506</c1>
-            <c2>Author Name</c2>
-            <c3>Chapter 1: The Beginning</c3>
-            <c4>It was a dark and stormy night...</c4>
-            
-            输出：
-            <c1>[页眉页脚]</c1>
-            <c2>[页眉页脚]</c2>
-            <c3># 第一章：开始</c3>
-            <c4>那是一个黑暗而暴风雨的夜晚……</c4>
-            
-            ===== 严格遵守输出格式 =====
-            <c1>第一段译文或空</c1>
-            <c2>第二段译文或空</c2>
+            输出： 
+            <c1>[页眉页脚]</c1> 
+            <c2>Khun Somchai对P'Niran说</c2> 
+            <c3>## 第一章：开始</c3> 
+            <c4>"我爱你，"John对Mary轻声说道。</c4>
+
+            ===== 严格遵守输出格式 ===== 
+            <c1>第一段译文或空</c1> 
+            <c2>第二段译文或空</c2> 
             ...
-            ```glossary
-            专有名词1⇢专有名词1
-            专有名词2⇢专有名词2
-            ```
-            
-            **专有名词处理示例**：
-            - 人名 "John Smith" → 译文中保持 "John Smith"，术语表中添加 "John Smith⇢John Smith"
-            - 地名 "Bangkok" → 译文中保持 "Bangkok"，术语表中添加 "Bangkok⇢Bangkok"
-            - 品牌 "iPhone" → 译文中保持 "iPhone"，术语表中添加 "iPhone⇢iPhone"
             """.strip())
 
         # --- 调用 LLM ---
@@ -802,26 +782,7 @@ for batch_num in range(1, total_batches + 1):
             cn_body = f"**解析失败**: {e}\n\n原始LLM输出:\n{llm_out[:1000]}..."
             new_terms_block = ""
 
-        # --- 更新术语表 ---
-        try:
-            new_terms_count = 0
-            for line in new_terms_block.splitlines():
-                if "\t" in line or "⇢" in line:
-                    # 支持两种格式：制表符分隔或箭头分隔
-                    if "⇢" in line:
-                        src, tgt = [x.strip() for x in line.split("⇢", 1)]
-                    else:
-                        src, tgt = [x.strip() for x in line.split("\t", 1)]
-                    
-                    if src and tgt and src not in GLOSSARY:
-                        GLOSSARY[src] = tgt
-                        new_terms_count += 1
-            
-            if new_terms_count > 0:
-                logging.info(f"📚 批次{batch_num}新增{new_terms_count}个术语")
-                
-        except Exception as e:
-            logging.warning(f"⚠️  批次{batch_num}术语表更新失败: {e}")
+        # --- 术语表处理已移除，不再处理术语表相关内容 ---
 
         # --- 写批次文件 ---
         try:
@@ -842,11 +803,7 @@ for batch_num in range(1, total_batches + 1):
             logging.error(f"❌ 批次{batch_num}文件写入失败: {e}")
             raise
         
-        # 保存进度（每处理完一章就保存术语表）
-        try:
-            save_glossary(GLOSSARY, gloss_path)
-        except Exception as e:
-            logging.warning(f"术语表保存失败: {e}")
+        # 术语表保存功能已移除
         
         # 适度限速
         time.sleep(1)
@@ -865,12 +822,8 @@ processed_batches_success = len([bid for bid in MISSING_DICT if not any("处理�
 failed_batches = [bid for bid, miss_list in MISSING_DICT.items() if any("失败" in str(m) or "错误" in str(m) for m in miss_list)]
 missing_segments = sum(len([m for m in miss_list if m != "翻译失败" and "错误" not in str(m)]) for miss_list in MISSING_DICT.values())
 
-# 1. 术语表
-try:
-    save_glossary(GLOSSARY, gloss_path)
-    logging.info(f"术语表已更新 → {gloss_path} (共{len(GLOSSARY)}个条目)")
-except Exception as e:
-    logging.error(f"术语表保存失败: {e}")
+# 1. 术语表功能已移除
+logging.info("术语表功能已禁用，专有名词通过prompt约束处理")
 
 # 2. 缺失段落清单
 try:
