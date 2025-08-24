@@ -249,14 +249,33 @@ def setup_logging(verbose: bool = False):
         force=True
     )
 
-def log_progress(current: int, total: int, prefix: str = "进度", suffix: str = ""):
-    """显示进度条"""
+def log_progress(current: int, total: int, prefix: str = "进度", suffix: str = "", start_time: float = None):
+    """显示进度条和时间估算"""
     percent = (current / total) * 100
     bar_length = 30
     filled_length = int(bar_length * current // total)
     bar = '█' * filled_length + '░' * (bar_length - filled_length)
     
-    logging.info(f"{prefix}: [{bar}] {percent:.1f}% ({current}/{total}) {suffix}")
+    time_info = ""
+    if start_time and current > 0:
+        elapsed_time = time.time() - start_time
+        if current < total:
+            estimated_total_time = elapsed_time * total / current
+            remaining_time = estimated_total_time - elapsed_time
+            
+            def format_time(seconds):
+                if seconds < 60:
+                    return f"{seconds:.0f}秒"
+                elif seconds < 3600:
+                    return f"{seconds/60:.1f}分钟"
+                else:
+                    return f"{seconds/3600:.1f}小时"
+            
+            time_info = f" | 已用时: {format_time(elapsed_time)} | 预计剩余: {format_time(remaining_time)}"
+        else:
+            time_info = f" | 总用时: {elapsed_time/60:.1f}分钟"
+    
+    logging.info(f"{prefix}: [{bar}] {percent:.1f}% ({current}/{total}){time_info} {suffix}")
 
 # 初始化日志系统
 setup_logging(verbose=CONFIG.get('verbose_logging', False))
@@ -313,11 +332,11 @@ def ensure_sentence_completion(text: str, next_batch_text: str = "") -> str:
             
             return text + completion
         else:
-            # 如果都没有找到，只补充一小部分内容（最多100字符）
-            max_supplement = min(100, len(next_text))
+            # 如果都没有找到，限制补充内容（最多50字符，因为现在只有预览文本）
+            max_supplement = min(50, len(next_text))
             completion = next_text[:max_supplement]
             
-            logging.info(f"📝 未找到明确句子结束，补充 {len(completion)} 个字符")
+            logging.info(f"📝 未找到明确句子结束，从预览文本补充 {len(completion)} 个字符")
             
             return text + completion
 
@@ -549,7 +568,8 @@ def get_pdf_text_with_cache(pdf_path: Path, cache_dir: Path) -> str:
         pages.append(page_text.rstrip())
     
     doc.close()
-    full_text = "\f".join(pages)  # 保持与原来的分页符一致
+    # 在分页符前后添加换行符，确保页码和章节标题能够正确分段
+    full_text = "\n\n\f\n\n".join(pages)
     
     extract_time = time.time() - start_time
     
@@ -599,6 +619,9 @@ processed_batches = 0
 logging.info(f"=== 开始分批翻译处理 ===")
 logging.info(f"总批次: {total_batches} | 每批页数: {PAGES_PER_BATCH} | 总页数: {total_pages}")
 
+# 记录批处理开始时间用于时间估算
+batch_start_time = time.time()
+
 def get_batch_text_with_cache(pages: List[str], batch_num: int, p_start: int, p_end: int, cache_dir: Path) -> str:
     """获取批次文本，优先使用缓存"""
     batch_id = f"batch_{batch_num:03d}"
@@ -640,7 +663,7 @@ for batch_num in range(1, total_batches + 1):
     batch_id = f"batch_{batch_num:03d}"
     
     logging.info(f"=== 处理批次 {batch_num}/{total_batches} (页 {p_start}-{p_end}) ===")
-    log_progress(processed_batches, total_batches, "批次进度", f"当前: 批次{batch_num}")
+    log_progress(processed_batches, total_batches, "批次进度", f"当前: 批次{batch_num}", batch_start_time)
     
     # 检查是否已有翻译结果缓存
     batch_md_file = CHAP_DIR / f"{batch_id}.md"
@@ -650,7 +673,7 @@ for batch_num in range(1, total_batches + 1):
             if cached_content.strip():
                 logging.info(f"💾 批次 {batch_num} 已存在翻译结果，跳过处理")
                 big_md_parts.append(cached_content)
-                log_progress(processed_batches, total_batches, "批次进度", "使用缓存")
+                log_progress(processed_batches, total_batches, "批次进度", "使用缓存", batch_start_time)
                 continue
         except Exception as e:
             logging.warning(f"读取批次翻译缓存失败: {e}，重新处理")
@@ -662,18 +685,20 @@ for batch_num in range(1, total_batches + 1):
         if not raw_eng.strip():
             logging.warning(f"📄 批次{batch_num}内容为空，跳过")
             MISSING_DICT[batch_id] = ["整批缺失"]
-            log_progress(processed_batches, total_batches, "批次进度", "内容为空")
+            log_progress(processed_batches, total_batches, "批次进度", "内容为空", batch_start_time)
             continue
         
         # 智能句子完整性处理：如果当前批次最后一句没有结束，从下一批次补充完整
         if batch_num < total_batches:  # 不是最后一个批次
-            # 获取下一批次的文本用于句子完整性检查
+            # 获取下一批次的开头部分用于句子完整性检查（避免过度读取）
             next_p_start = batch_num * PAGES_PER_BATCH + 1
             next_p_end = min((batch_num + 1) * PAGES_PER_BATCH, total_pages)
             try:
                 next_batch_text = get_batch_text_with_cache(pages, batch_num + 1, next_p_start, next_p_end, RAW_CONTENT_DIR)
+                # 只取下一批次的开头部分（最多1000字符），避免过度读取
+                next_batch_preview = next_batch_text[:1000] if next_batch_text else ""
                 # 应用智能句子完整性处理
-                raw_eng = ensure_sentence_completion(raw_eng, next_batch_text)
+                raw_eng = ensure_sentence_completion(raw_eng, next_batch_preview)
             except Exception as e:
                 logging.warning(f"获取下一批次文本失败，跳过句子完整性处理: {e}")
                 # 如果获取下一批次失败，仍然使用原始文本
@@ -734,6 +759,8 @@ for batch_num in range(1, total_batches + 1):
                • 章节标题 → ## 第XX章 标题（严格两位数编号：01、02、03...，去除所有装饰符号）
                • 序章/尾声/作者话 → ## 序章 / ## 尾声 / ## 作者的话
                • 番外/特别篇/外传 → ## 番外01 标题内容 / ## 特别篇01 标题内容 / ## 外传01 标题内容
+               • 作者的话、前言、后记等 → ## 作者的话
+               • 目录、索引等 → [目录]
                • 分隔符 → ——————————（统一使用6个长横线）
             6. **文学性**：追求韵律美感，准确传达情感，保留修辞手法，营造意境，适应中文表达习惯。
             7. **风格**：保持原文特征{style_cache}，第三人称对话改第一人称，中文标点，连续句号改省略号，优选文学词汇。
