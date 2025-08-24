@@ -13,10 +13,10 @@ import json, re, textwrap, logging, time, datetime, requests, os, sys, warnings,
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
-# 过滤pdfminer的字体警告信息
-warnings.filterwarnings("ignore", category=UserWarning, module="pdfminer")
+# 过滤PyMuPDF的警告信息
+warnings.filterwarnings("ignore", category=UserWarning, module="fitz")
 
-from pdfminer.high_level import extract_text   # pip install pdfminer.six
+import fitz  # PyMuPDF - pip install PyMuPDF
 
 # 成本跟踪全局变量
 total_cost = 0.0
@@ -560,7 +560,27 @@ def get_pdf_text_with_cache(pdf_path: Path, cache_dir: Path) -> str:
     import time
     start_time = time.time()
     
-    full_text = extract_text(str(pdf_path), page_numbers=None)
+    # 使用PyMuPDF提取文本，更好地处理段落结构
+    doc = fitz.open(str(pdf_path))
+    pages = []
+    
+    for page_num in range(doc.page_count):
+        page = doc[page_num]
+        # 使用sort=True获得更好的阅读顺序
+        # 使用blocks模式获得更好的段落结构
+        blocks = page.get_text("blocks", sort=True)
+        page_text = ""
+        
+        for block in blocks:
+            if len(block) >= 5 and block[4]:  # 文本块
+                block_text = block[4].strip()
+                if block_text:
+                    page_text += block_text + "\n\n"
+        
+        pages.append(page_text.rstrip())
+    
+    doc.close()
+    full_text = "\f".join(pages)  # 保持与原来的分页符一致
     
     extract_time = time.time() - start_time
     
@@ -583,7 +603,7 @@ try:
     if not full_text or not full_text.strip():
         raise ValueError("PDF文件内容为空或无法提取文本")
     
-    pages = re.split(r"\f", full_text)                           # pdfminer 按 formfeed 分页
+    pages = re.split(r"\f", full_text)                           # PyMuPDF 按 formfeed 分页
     if pages and pages[-1] == "":
         pages.pop()
     

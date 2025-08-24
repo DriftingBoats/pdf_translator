@@ -1,5 +1,5 @@
 # PDF翻译脚本依赖包
-pdfminer.six>=20231228  # PDF文本提取和解析
+PyMuPDF>=1.23.0         # PDF文本提取和解析（更快更准确）
 requests>=2.31.0        # HTTP API调用（LLM接口）
 PyYAML>=6.0.1           # YAML配置文件处理（可选）
 tqdm>=4.66.1            # 进度条显示（保留备用）

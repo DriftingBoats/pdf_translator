@@ -5,3 +5,4 @@ output/
 achieve/
 __pycache__
 pdf-translator-web/
+translator.py.backup
