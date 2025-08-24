@@ -333,7 +333,7 @@ def wrap_batch_with_tags(raw_text: str) -> str:
     return "\n\n".join(tagged)
 
 def strip_tags(llm_output: str, keep_missing: bool = True):
-    """清洗 LLM 输出 & 收集缺失段，优化页眉页脚识别逻辑"""
+    """清洗 LLM 输出 & 收集缺失段，过滤LLM标记的页眉页脚"""
     paragraphs = TAG_PAT.findall(llm_output)
 
     miss_list, clean_paras = [], []
@@ -347,8 +347,8 @@ def strip_tags(llm_output: str, keep_missing: bool = True):
         elif content == "":
             # 跳过完全空的内容
             pass
-        elif _is_header_footer_content(content):
-            # 使用更智能的页眉页脚识别逻辑
+        elif content == "[页眉页脚]":
+            # 只过滤LLM明确标记的页眉页脚
             pass
         else:
             clean_paras.append(content)
@@ -359,38 +359,7 @@ def strip_tags(llm_output: str, keep_missing: bool = True):
     # 术语表功能已移除，不再处理术语表内容
     return pure_text, "", miss_list
 
-def _is_header_footer_content(content: str) -> bool:
-    """智能识别页眉页脚内容，避免误判正常文本"""
-    # 明确的页眉页脚标记
-    if content.startswith("[页眉页脚]") or content.startswith("[目录]"):
-        return True
-    
-    # 页码模式（更严格的匹配）
-    page_patterns = [
-        r'^Page\s+\d+\s+of\s+\d+$',  # "Page 1 of 506"
-        r'^第\d+页/共\d+页$',        # "第1页/共506页"
-        r'^\d+\s*/\s*\d+$',         # "1/506"
-        r'^\d+$'                    # 单独的数字（但要小心，可能是正文）
-    ]
-    
-    for pattern in page_patterns:
-        if re.match(pattern, content.strip(), re.IGNORECASE):
-            return True
-    
-    # 网址和邮箱模式
-    if re.search(r'https?://|www\.|@.*\.(com|org|net)', content, re.IGNORECASE):
-        return True
-    
-    # 版权信息
-    if re.search(r'copyright|©|版权所有|all rights reserved', content, re.IGNORECASE):
-        return True
-    
-    # 作者信息重复（但要谨慎，避免误判正文中的作者名）
-    # 只有当内容很短且看起来像重复的作者信息时才判断为页眉页脚
-    if len(content) < 50 and re.search(r'^(author|作者)[:：]?\s*[A-Za-z\s]+$', content, re.IGNORECASE):
-        return True
-    
-    return False
+
 
 def refresh_style(sample_text: str):
     """若 style_cache 为空，则用原文样本让 LLM 归纳风格；否则跳过"""
@@ -754,23 +723,33 @@ for batch_num in range(1, total_batches + 1):
             ===== 核心要求 =====
             1. **段落对齐**：每个<cN>段落必须对应输出<cN>段落，不可合并/跳过。无法翻译时用<cN>{{{{MISSING}}}}</cN>。
             2. **完整性**：必须翻译所有段落，特别注意最后一段！完成后检查是否有遗漏。
-            3. **特殊标记**：
-               • 页码/版权/重复信息 → <cN>[页眉页脚]</cN>
+            3. **专有名词处理**（严格遵守）：
+               • 人名：保持英文原文不翻译（如：John, Mary, Smith等）
+               • 泰语称呼：保持原文（如：Khun, P', N', Phi, Nong, Ajarn, Krub, Ka等）
+            4. **页眉页脚处理**：
+               • 页码 → <cN>[页眉页脚]</cN>
+               • 重复的作者署名 → <cN>[页眉页脚]</cN>
+               • 其他与正文无关的元数据 → <cN>[页眉页脚]</cN>
+            5. **特殊标记**：
                • 章节标题 → ## 第XX章 标题（严格两位数编号：01、02、03...，去除所有装饰符号）
                • 序章/尾声/作者话 → ## 序章 / ## 尾声 / ## 作者的话
                • 番外/特别篇/外传 → ## 番外01 标题内容 / ## 特别篇01 标题内容 / ## 外传01 标题内容
                • 分隔符 → ——————————（统一使用6个长横线）
-            4. **专名处理**：
-               • 人名保持英文原文
-               • 泰语称呼保持原文：Khun/P'/N'/Phi/Nong/Ajarn/Krub/Ka等
-               • 品牌名保持原文
-            5. **文学性**：追求韵律美感，准确传达情感，保留修辞手法，营造意境，适应中文表达习惯。
-            6. **风格**：保持原文特征{style_cache}，第三人称对话改第一人称，中文标点，连续句号改省略号，优选文学词汇。
+            6. **文学性**：追求韵律美感，准确传达情感，保留修辞手法，营造意境，适应中文表达习惯。
+            7. **风格**：保持原文特征{style_cache}，第三人称对话改第一人称，中文标点，连续句号改省略号，优选文学词汇。
+
+            ===== 重要提醒 =====
+            • 必须将所有段落翻译成中文，输出<cN>标签数量与输入完全对应
+            • 无法翻译时使用<cN>{{{{MISSING}}}}</cN>
+            • 如果遇到无法理解的内容，使用<cN>{{{{MISSING}}}}</cN>而不是跳过
+            • 绝对不能跳过任何段落，即使内容很短或看似不重要
+            • 专有名词（人名、地名、品牌名、机构名、泰语称呼）必须保持原文不翻译
 
             ===== 输出格式 =====
             <c1>第一段译文</c1>
             <c2>第二段译文</c2>
             ...
+            <cN>最后一段译文</cN>
             """.strip())
 
         # --- 调用 LLM ---
@@ -824,7 +803,7 @@ for batch_num in range(1, total_batches + 1):
                     if f"c{tag_num:03d}" not in miss:
                         miss.append(f"c{tag_num:03d}")
                 WARNING_DICT[batch_id] = f"遗漏段落: c{missing_list}"
-            elif abs(original_segments - translated_segments) > original_segments * 0.2:  # 允许20%的差异
+            elif abs(original_segments - translated_segments) > original_segments * 0.1:  # 允许10%的差异
                 warning_msg = f"原文{original_segments}段 vs 译文{translated_segments}段"
                 logging.warning(f"⚠️  批次{batch_num}段落数量差异较大: {warning_msg}")
                 WARNING_DICT[batch_id] = warning_msg
