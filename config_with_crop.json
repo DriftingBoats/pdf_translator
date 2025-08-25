@@ -1,0 +1,31 @@
+{
+  "api": {
+    "API_URL": "https://api.openai.com/v1/chat/completions",
+    "API_KEY": "your-api-key-here",
+    "LLM_MODEL": "gpt-4",
+    "temperature": 0.2
+  },
+  "paths": {
+    "pdf": "input.pdf",
+    "output_dir": "output",
+    "big_md_name": "translated_book.md"
+  },
+  "pages_per_batch": 10,
+  "clean_cache_on_start": true,
+  "pdf_crop": {
+    "enable": true,
+    "margins": {
+      "top": 50,
+      "bottom": 50,
+      "left": 0,
+      "right": 0
+    },
+    "auto_detect_headers": true
+  },
+  "pricing": {
+    "enable_cost_tracking": true,
+    "input_price_per_1k_tokens": 0.03,
+    "output_price_per_1k_tokens": 0.06,
+    "currency": "USD"
+  }
+}

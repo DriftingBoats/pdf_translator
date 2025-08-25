@@ -1,0 +1,31 @@
+{
+  "api": {
+    "API_URL": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    "API_KEY": "your-doubao-api-key-here",
+    "LLM_MODEL": "doubao-seed-1-6-250615",
+    "temperature": 0.5
+  },
+  "pricing": {
+    "input_price_per_1k_tokens": 0.0008,
+    "output_price_per_1k_tokens": 0.004,
+    "currency": "CNY",
+    "enable_cost_tracking": true
+  },
+  "paths": {
+    "pdf": "test_document.pdf",
+    "output_dir": "output/test_doubao",
+    "big_md_name": "translated_document.md"
+  },
+  "pages_per_batch": 8,
+  "clean_cache_on_start": false,
+  "pdf_crop": {
+    "enable": false,
+    "auto_detect_headers": true,
+    "margins": {
+      "top": 50,
+      "bottom": 50,
+      "left": 30,
+      "right": 30
+    }
+  }
+}

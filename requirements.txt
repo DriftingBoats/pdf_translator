@@ -4,3 +4,5 @@ requests>=2.31.0        # HTTP API调用（LLM接口）
 PyYAML>=6.0.1           # YAML配置文件处理（可选）
 tqdm>=4.66.1            # 进度条显示（保留备用）
 pathlib2>=2.3.7         # 路径处理增强（Python < 3.4兼容）
+Pillow>=10.0.0          # 图像处理库（PDF可视化裁切工具）
+PyQt6>=6.5.0            # 现代化GUI框架（PDF裁切可视化工具）

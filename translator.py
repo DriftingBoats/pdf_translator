@@ -17,6 +17,7 @@ from typing import Dict, List, Tuple, Optional
 warnings.filterwarnings("ignore", category=UserWarning, module="fitz")
 
 import fitz  # PyMuPDF - pip install PyMuPDF
+from pdf_crop_tool import PDFCropTool  # 导入PDF裁切工具
 
 # 成本跟踪全局变量
 total_cost = 0.0
@@ -163,6 +164,12 @@ BIG_MD_NAME  = CONFIG["paths"]["big_md_name"]
 
 # 新增配置项：每批处理的页数
 PAGES_PER_BATCH = CONFIG.get("pages_per_batch", 10)  # 默认每10页翻译一次
+
+# PDF裁切配置
+PDF_CROP_CONFIG = CONFIG.get("pdf_crop", {})
+ENABLE_PDF_CROP = PDF_CROP_CONFIG.get("enable", False)
+CROP_MARGINS = PDF_CROP_CONFIG.get("margins", {"top": 50, "bottom": 50, "left": 0, "right": 0})
+AUTO_DETECT_HEADERS = PDF_CROP_CONFIG.get("auto_detect_headers", True)
 
 # 验证PDF文件存在
 if not PDF_PATH.exists():
@@ -552,8 +559,36 @@ def get_pdf_text_with_cache(pdf_path: Path, cache_dir: Path) -> str:
     doc = fitz.open(str(pdf_path))
     pages = []
     
+    # 初始化PDF裁切工具（如果启用）
+    crop_tool = None
+    if ENABLE_PDF_CROP:
+        try:
+            crop_tool = PDFCropTool(str(pdf_path))
+            if AUTO_DETECT_HEADERS:
+                logging.info("🔍 自动检测页眉页脚区域...")
+                crop_analysis = crop_tool.analyze_layout()
+                if crop_analysis:
+                    logging.info(f"📊 检测到潜在页眉页脚区域: {len(crop_analysis)} 个")
+            logging.info(f"✂️  PDF裁切已启用，边距设置: {CROP_MARGINS}")
+        except Exception as e:
+            logging.warning(f"PDF裁切工具初始化失败: {e}，将使用原始PDF")
+            crop_tool = None
+    
     for page_num in range(doc.page_count):
         page = doc[page_num]
+        
+        # 应用PDF裁切（如果启用）
+        if crop_tool:
+            try:
+                if AUTO_DETECT_HEADERS:
+                    # 自动检测并裁切
+                    crop_tool.auto_crop_page(page_num, **CROP_MARGINS)
+                else:
+                    # 手动裁切
+                    crop_tool.crop_page(page_num, **CROP_MARGINS)
+            except Exception as e:
+                logging.warning(f"页面 {page_num + 1} 裁切失败: {e}，使用原始页面")
+        
         # 使用sort=True获得更好的阅读顺序
         # 使用blocks模式获得更好的段落结构
         blocks = page.get_text("blocks", sort=True)
@@ -566,6 +601,10 @@ def get_pdf_text_with_cache(pdf_path: Path, cache_dir: Path) -> str:
                     page_text += block_text + "\n\n"
         
         pages.append(page_text.rstrip())
+    
+    # 关闭PDF裁切工具
+    if crop_tool:
+        crop_tool.close()
     
     doc.close()
     # 在分页符前后添加换行符，确保页码和章节标题能够正确分段
